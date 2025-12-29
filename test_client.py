@@ -121,6 +121,20 @@ def run_tests():
     else:
         failed += 1
 
+    # Test: Head bucket (exists)
+    status, body = request("HEAD", "/testbucket")
+    if test("Head bucket (exists)", 200, status, body):
+        passed += 1
+    else:
+        failed += 1
+
+    # Test: Head bucket (not exists)
+    status, body = request("HEAD", "/nonexistentbucket")
+    if test("Head bucket (not exists)", 404, status, body):
+        passed += 1
+    else:
+        failed += 1
+
     # Object operations
     print("\n[Object Operations]")
 
@@ -217,6 +231,29 @@ def run_tests():
     else:
         failed += 1
         print(f"        Got: {body}")
+
+    # Batch Operations
+    print("\n[Batch Operations]")
+
+    # Create files for batch delete
+    request("PUT", "/testbucket/batch1.txt", "batch1")
+    request("PUT", "/testbucket/batch2.txt", "batch2")
+    request("PUT", "/testbucket/batch3.txt", "batch3")
+
+    # Test: DeleteObjects batch
+    delete_xml = '<Delete><Object><Key>batch1.txt</Key></Object><Object><Key>batch2.txt</Key></Object><Object><Key>batch3.txt</Key></Object></Delete>'
+    status, body = request("POST", "/testbucket", delete_xml, query="delete")
+    if test("DeleteObjects batch", 200, status, body) and "batch1.txt" in body and "batch2.txt" in body:
+        passed += 1
+    else:
+        failed += 1
+
+    # Verify files are deleted
+    status, body = request("GET", "/testbucket/batch1.txt")
+    if test("Verify batch delete (file gone)", 404, status, body):
+        passed += 1
+    else:
+        failed += 1
 
     # Cleanup
     print("\n[Cleanup]")

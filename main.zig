@@ -469,7 +469,11 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
             try handleDeleteObject(ctx, allocator, res, bucket, key);
         }
     } else if (std.mem.eql(u8, req.method, "HEAD")) {
-        try handleHeadObject(ctx, allocator, res, bucket, key);
+        if (key.len == 0) {
+            try handleHeadBucket(ctx, allocator, res, bucket);
+        } else {
+            try handleHeadObject(ctx, allocator, res, bucket, key);
+        }
     } else if (std.mem.eql(u8, req.method, "POST")) {
         if (hasQuery(req.query, "delete")) {
             try handleDeleteObjects(ctx, allocator, req, res, bucket);
@@ -1044,6 +1048,19 @@ fn handleCreateBucket(ctx: *const S3Context, allocator: Allocator, res: *Respons
             return;
         },
     };
+
+    res.ok();
+}
+
+fn handleHeadBucket(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8) !void {
+    const path = try ctx.bucketPath(allocator, bucket);
+    defer allocator.free(path);
+
+    var dir = std.fs.cwd().openDir(path, .{}) catch {
+        sendError(res, 404, "NoSuchBucket", "Bucket not found");
+        return;
+    };
+    dir.close();
 
     res.ok();
 }
