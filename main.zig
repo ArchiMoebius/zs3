@@ -35,9 +35,21 @@ pub fn main() !void {
 
     if (builtin.os.tag == .linux) {
         try eventLoopEpoll(allocator, &ctx, &server);
-    } else {
-        try eventLoopPoll(allocator, &ctx, &server);
+    } else if (builtin.os.tag == .macos) {
+        try eventLoopKqueue(allocator, &ctx, &server);
     }
+}
+
+fn setNonBlocking(fd: posix.fd_t) void {
+    const O_NONBLOCK: usize = if (builtin.os.tag == .macos) 0x0004 else 0x800;
+    const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return;
+    _ = posix.fcntl(fd, posix.F.SETFL, flags | O_NONBLOCK) catch {};
+}
+
+fn setBlocking(fd: posix.fd_t) void {
+    const O_NONBLOCK: usize = if (builtin.os.tag == .macos) 0x0004 else 0x800;
+    const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return;
+    _ = posix.fcntl(fd, posix.F.SETFL, flags & ~O_NONBLOCK) catch {};
 }
 
 fn eventLoopEpoll(allocator: Allocator, ctx: *const S3Context, server: *net.Server) !void {
@@ -46,6 +58,7 @@ fn eventLoopEpoll(allocator: Allocator, ctx: *const S3Context, server: *net.Serv
     if (@as(isize, @bitCast(epfd)) < 0) return error.EpollCreate;
     defer _ = linux.close(@intCast(epfd));
 
+    setNonBlocking(server.stream.handle);
     var ev = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .fd = server.stream.handle } };
     if (@as(isize, @bitCast(linux.epoll_ctl(@intCast(epfd), linux.EPOLL.CTL_ADD, server.stream.handle, &ev))) < 0)
         return error.EpollCtl;
@@ -73,41 +86,53 @@ fn eventLoopEpoll(allocator: Allocator, ctx: *const S3Context, server: *net.Serv
     }
 }
 
-fn setNonBlocking(fd: posix.fd_t) void {
-    const O_NONBLOCK: usize = if (builtin.os.tag == .macos) 0x0004 else 0x800;
-    const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return;
-    _ = posix.fcntl(fd, posix.F.SETFL, flags | O_NONBLOCK) catch {};
-}
+fn eventLoopKqueue(allocator: Allocator, ctx: *const S3Context, server: *net.Server) !void {
+    const c = std.c;
+    const kq = c.kqueue();
+    if (kq < 0) return error.Kqueue;
+    defer _ = c.close(kq);
 
-fn eventLoopPoll(allocator: Allocator, ctx: *const S3Context, server: *net.Server) !void {
-    var fds: [MAX_CONNECTIONS + 1]posix.pollfd = undefined;
-    var nfds: usize = 1;
+    const server_fd = server.stream.handle;
+    setNonBlocking(server_fd);
 
-    setNonBlocking(server.stream.handle);
-    fds[0] = .{ .fd = server.stream.handle, .events = posix.POLL.IN, .revents = 0 };
+    var changes: [1]c.Kevent = .{.{
+        .ident = @intCast(server_fd),
+        .filter = c.EVFILT.READ,
+        .flags = c.EV.ADD,
+        .fflags = 0,
+        .data = 0,
+        .udata = 0,
+    }};
+    var events: [MAX_CONNECTIONS]c.Kevent = undefined;
+    if (c.kevent(kq, &changes, 1, &events, 0, null) < 0) return error.Kevent;
 
     while (true) {
-        const ready = posix.poll(fds[0..nfds], -1) catch continue;
-        if (ready == 0) continue;
+        const nev = c.kevent(kq, &changes, 0, &events, MAX_CONNECTIONS, null);
+        if (nev < 0) continue;
 
-        if (fds[0].revents & posix.POLL.IN != 0) {
-            while (nfds <= MAX_CONNECTIONS) {
-                const conn = server.accept() catch break;
-                fds[nfds] = .{ .fd = conn.stream.handle, .events = posix.POLL.IN, .revents = 0 };
-                nfds += 1;
-            }
-        }
-
-        var i: usize = 1;
-        while (i < nfds) {
-            if (fds[i].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) {
-                const stream = net.Stream{ .handle = fds[i].fd };
-                handleConnectionWithStream(allocator, ctx, stream) catch {};
-                stream.close();
-                fds[i] = fds[nfds - 1];
-                nfds -= 1;
+        for (events[0..@intCast(nev)]) |ev| {
+            const fd: posix.fd_t = @intCast(ev.ident);
+            if (fd == server_fd) {
+                while (true) {
+                    const conn = server.accept() catch break;
+                    var add: [1]c.Kevent = .{.{
+                        .ident = @intCast(conn.stream.handle),
+                        .filter = c.EVFILT.READ,
+                        .flags = c.EV.ADD | c.EV.ONESHOT,
+                        .fflags = 0,
+                        .data = 0,
+                        .udata = 0,
+                    }};
+                    const r = c.kevent(kq, &add, 1, &events, 0, null);
+                    if (r < 0) std.log.err("kevent add failed", .{});
+                }
             } else {
-                i += 1;
+                setBlocking(fd);
+                const stream = net.Stream{ .handle = fd };
+                handleConnectionWithStream(allocator, ctx, stream) catch |err| {
+                    std.log.err("Connection error: {}", .{err});
+                };
+                stream.close();
             }
         }
     }
@@ -205,12 +230,23 @@ const Response = struct {
     }
 };
 
+fn waitForData(fd: posix.fd_t) !void {
+    var pfd = [1]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    _ = try posix.poll(&pfd, 30000);
+}
+
 fn parseRequest(allocator: Allocator, stream: net.Stream) !Request {
     var buf: [MAX_HEADER_SIZE]u8 = undefined;
     var total_read: usize = 0;
 
     while (total_read < buf.len) {
-        const n = try stream.read(buf[total_read..]);
+        const n = stream.read(buf[total_read..]) catch |err| {
+            if (err == error.WouldBlock) {
+                waitForData(stream.handle) catch return err;
+                continue;
+            }
+            return err;
+        };
         if (n == 0) break;
         total_read += n;
 
@@ -264,7 +300,13 @@ fn parseRequest(allocator: Allocator, stream: net.Stream) !Request {
             var remaining = content_length - already_read;
             var offset = already_read;
             while (remaining > 0) {
-                const n = try stream.read(body_buf[offset..]);
+                const n = stream.read(body_buf[offset..]) catch |err| {
+                    if (err == error.WouldBlock) {
+                        waitForData(stream.handle) catch return err;
+                        continue;
+                    }
+                    return err;
+                };
                 if (n == 0) break;
                 offset += n;
                 remaining -= n;
@@ -287,7 +329,10 @@ fn handleConnectionWithStream(allocator: Allocator, ctx: *const S3Context, strea
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var req = try parseRequest(alloc, stream);
+    var req = parseRequest(alloc, stream) catch |err| {
+        std.log.err("parseRequest failed: {}", .{err});
+        return err;
+    };
     defer req.deinit();
 
     var res = Response.init(alloc);
