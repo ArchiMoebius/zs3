@@ -471,7 +471,9 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
     } else if (std.mem.eql(u8, req.method, "HEAD")) {
         try handleHeadObject(ctx, allocator, res, bucket, key);
     } else if (std.mem.eql(u8, req.method, "POST")) {
-        if (hasQuery(req.query, "uploads")) {
+        if (hasQuery(req.query, "delete")) {
+            try handleDeleteObjects(ctx, allocator, req, res, bucket);
+        } else if (hasQuery(req.query, "uploads")) {
             try handleInitiateMultipart(ctx, allocator, res, bucket, key);
         } else if (hasQuery(req.query, "uploadId")) {
             try handleCompleteMultipart(ctx, allocator, req, res, bucket, key);
@@ -791,23 +793,64 @@ fn handleDeleteObject(ctx: *const S3Context, allocator: Allocator, res: *Respons
     const path = try ctx.objectPath(allocator, bucket, key);
     defer allocator.free(path);
 
+    deleteObjectInternal(ctx, allocator, bucket, path);
+    res.noContent();
+}
+
+fn deleteObjectInternal(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, path: []const u8) void {
     std.fs.cwd().deleteFile(path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => std.log.warn("delete failed: {}", .{err}),
     };
 
     // Clean up empty parent directories up to bucket level
-    const bucket_path = try ctx.bucketPath(allocator, bucket);
+    const bucket_path = ctx.bucketPath(allocator, bucket) catch return;
     defer allocator.free(bucket_path);
 
     var dir_path = std.fs.path.dirname(path);
     while (dir_path) |dp| {
         if (dp.len <= bucket_path.len) break;
-        std.fs.cwd().deleteDir(dp) catch break; // stop if not empty
+        std.fs.cwd().deleteDir(dp) catch break;
         dir_path = std.fs.path.dirname(dp);
     }
+}
 
-    res.noContent();
+fn handleDeleteObjects(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8) !void {
+    // Parse XML body: <Delete><Object><Key>...</Key></Object>...</Delete>
+    var xml: std.ArrayListUnmanaged(u8) = .empty;
+    defer xml.deinit(allocator);
+
+    try xml.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    try xml.appendSlice(allocator, "<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+
+    // Simple XML parsing - find all <Key>...</Key> pairs
+    var body = req.body;
+    var deleted_count: usize = 0;
+
+    while (std.mem.indexOf(u8, body, "<Key>")) |start| {
+        const key_start = start + 5;
+        const end = std.mem.indexOf(u8, body[key_start..], "</Key>") orelse break;
+        const key = body[key_start .. key_start + end];
+
+        if (key.len > 0 and isValidKey(key)) {
+            const path = ctx.objectPath(allocator, bucket, key) catch continue;
+            defer allocator.free(path);
+
+            deleteObjectInternal(ctx, allocator, bucket, path);
+
+            try xml.appendSlice(allocator, "<Deleted><Key>");
+            try xml.appendSlice(allocator, key);
+            try xml.appendSlice(allocator, "</Key></Deleted>");
+            deleted_count += 1;
+        }
+
+        body = body[key_start + end + 6 ..];
+    }
+
+    try xml.appendSlice(allocator, "</DeleteResult>");
+
+    res.ok();
+    res.setXmlBody(try xml.toOwnedSlice(allocator));
 }
 
 fn handleHeadObject(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8, key: []const u8) !void {
