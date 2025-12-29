@@ -6,27 +6,27 @@ zs3 is a single-file HTTP server implementing the S3 REST API.
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                    main()                        │
-│              (connection loop)                   │
+│                    main()                       │
+│              (connection loop)                  │
 └─────────────────────┬───────────────────────────┘
                       │
                       ▼
 ┌─────────────────────────────────────────────────┐
-│              handleConnection()                  │
-│         (parse request, write response)          │
+│              handleConnection()                 │
+│         (parse request, write response)         │
 └─────────────────────┬───────────────────────────┘
                       │
           ┌───────────┴───────────┐
           ▼                       ▼
 ┌──────────────────┐    ┌──────────────────┐
 │   SigV4.verify() │    │     route()      │
-│  (authenticate)  │    │ (dispatch handler)│
+│  (authenticate)  │    │(dispatch handler)│
 └──────────────────┘    └────────┬─────────┘
                                  │
          ┌───────────────────────┼───────────────────────┐
          ▼                       ▼                       ▼
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│  handlePutObject │    │  handleGetObject │    │     ...         │
+│  handlePutObject│    │ handleGetObject │    │     ...         │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
 ```
 
