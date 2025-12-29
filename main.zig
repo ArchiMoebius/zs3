@@ -32,12 +32,21 @@ pub fn main() !void {
 
     while (true) {
         var conn = server.accept() catch continue;
-        defer conn.stream.close();
 
-        handleConnection(allocator, &ctx, &conn) catch |err| {
-            std.log.err("Connection error: {}", .{err});
+        const thread = std.Thread.spawn(.{}, handleConnectionThread, .{ allocator, &ctx, conn.stream }) catch {
+            conn.stream.close();
+            continue;
         };
+        thread.detach();
     }
+}
+
+fn handleConnectionThread(allocator: Allocator, ctx: *const S3Context, stream: net.Stream) void {
+    defer stream.close();
+
+    handleConnectionWithStream(allocator, ctx, stream) catch |err| {
+        std.log.err("Connection error: {}", .{err});
+    };
 }
 
 const S3Context = struct {
@@ -209,12 +218,12 @@ fn parseRequest(allocator: Allocator, stream: net.Stream) !Request {
     };
 }
 
-fn handleConnection(allocator: Allocator, ctx: *const S3Context, conn: *net.Server.Connection) !void {
+fn handleConnectionWithStream(allocator: Allocator, ctx: *const S3Context, stream: net.Stream) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var req = try parseRequest(alloc, conn.stream);
+    var req = try parseRequest(alloc, stream);
     defer req.deinit();
 
     var res = Response.init(alloc);
@@ -225,7 +234,7 @@ fn handleConnection(allocator: Allocator, ctx: *const S3Context, conn: *net.Serv
         sendError(&res, 500, "InternalError", "Internal server error");
     };
 
-    try res.write(conn.stream);
+    try res.write(stream);
 }
 
 pub fn isValidBucketName(name: []const u8) bool {
