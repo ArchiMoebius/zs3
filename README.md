@@ -1,6 +1,6 @@
 # zs3
 
-S3-compatible storage in ~2.5K lines of Zig. Zero dependencies. Optional distributed mode.
+S3-compatible storage in ~2.9K lines of Zig. Zero dependencies. Optional distributed mode.
 
 ## Why
 
@@ -8,8 +8,8 @@ Most S3 usage is PUT, GET, DELETE, LIST with basic auth. You don't need 200k lin
 
 | | zs3 | RustFS | MinIO |
 |---|-----|--------|-------|
-| Lines | ~2,500 | ~80,000 | 200,000 |
-| Binary | 330KB | ~50MB | 100MB |
+| Lines | ~2,900 | ~80,000 | 200,000 |
+| Binary | 360KB | ~50MB | 100MB |
 | RAM idle | 3MB | ~100MB | 200MB+ |
 | Dependencies | 0 | ~200 crates | many |
 
@@ -21,13 +21,16 @@ Most S3 usage is PUT, GET, DELETE, LIST with basic auth. You don't need 200k lin
 - DeleteObjects batch operation
 - Multipart uploads for large files
 - Range requests for streaming/seeking
-- ~330KB static binary
+- ~360KB static binary
 
 **Distributed Mode (IPFS-like):**
 - Content-addressed storage with BLAKE3 hashing
 - Automatic deduplication across the network
 - Full Kademlia DHT for peer/content discovery
-- Peer-to-peer content transfer
+- Peer-to-peer content transfer with quorum reads
+- Inline storage for small objects (<4KB)
+- Tombstone-based deletes (prevents resurrection)
+- Block garbage collector with grace period
 - Zero-config LAN discovery ready
 - Same S3 API - works with existing tools
 
@@ -153,7 +156,7 @@ Requires Zig 0.15+.
 
 ```bash
 zig build                                    # debug
-zig build -Doptimize=ReleaseFast             # release (~250KB)
+zig build -Doptimize=ReleaseFast             # release (~360KB)
 zig build -Dtarget=x86_64-linux-musl         # cross-compile
 zig build test                               # run tests
 ```

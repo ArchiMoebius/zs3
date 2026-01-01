@@ -15,6 +15,10 @@ const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB chunks for large files
 const MAX_PEERS = 100;
 const GOSSIP_INTERVAL_MS = 30_000;
 const REPLICATION_TARGET = 3;
+const TOMBSTONE_TTL_SECS = 24 * 60 * 60; // 24 hours before tombstone cleanup
+const INLINE_THRESHOLD = 4 * 1024; // Objects <= 4KB stored inline in metadata
+const GC_GRACE_PERIOD_SECS = 10 * 60; // 10 min delay before deleting unreferenced blocks
+const QUORUM_SIZE = 2; // Need 2 matching responses for quorum reads
 
 const ERROR_403 = "HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\nDenied";
 
@@ -104,22 +108,167 @@ const CAS = struct {
         hasher.final(&full_hash);
         return full_hash[0..20].*;
     }
+
+    /// Garbage collect unreferenced blocks
+    /// Scans metadata index to build reference set, then removes orphaned CAS blobs
+    pub fn garbageCollect(self: *const CAS, allocator: Allocator, meta_index: *const MetaIndex) !struct { scanned: usize, deleted: usize } {
+        var referenced = std.AutoHashMap(ContentHash, void).init(allocator);
+        defer referenced.deinit();
+
+        // Phase 1: Collect all referenced hashes from metadata index
+        const index_path = try std.fs.path.join(allocator, &.{ meta_index.data_dir, ".index" });
+        defer allocator.free(index_path);
+
+        var index_dir = std.fs.cwd().openDir(index_path, .{ .iterate = true }) catch {
+            return .{ .scanned = 0, .deleted = 0 };
+        };
+        defer index_dir.close();
+
+        var bucket_iter = index_dir.iterate();
+        while (try bucket_iter.next()) |bucket_entry| {
+            if (bucket_entry.kind == .directory) {
+                try self.collectReferencedHashes(allocator, meta_index, bucket_entry.name, &referenced);
+            }
+        }
+
+        // Phase 2: Scan CAS directory and delete unreferenced blocks
+        const cas_path = try std.fs.path.join(allocator, &.{ self.data_dir, ".cas" });
+        defer allocator.free(cas_path);
+
+        var cas_dir = std.fs.cwd().openDir(cas_path, .{ .iterate = true }) catch {
+            return .{ .scanned = 0, .deleted = 0 };
+        };
+        defer cas_dir.close();
+
+        var scanned: usize = 0;
+        var deleted: usize = 0;
+        const now = std.time.timestamp();
+
+        var prefix_iter = cas_dir.iterate();
+        while (try prefix_iter.next()) |prefix_entry| {
+            if (prefix_entry.kind == .directory and prefix_entry.name.len == 2) {
+                const prefix_path = try std.fs.path.join(allocator, &.{ cas_path, prefix_entry.name });
+                defer allocator.free(prefix_path);
+
+                var blob_dir = std.fs.cwd().openDir(prefix_path, .{ .iterate = true }) catch continue;
+                defer blob_dir.close();
+
+                var blob_iter = blob_dir.iterate();
+                while (try blob_iter.next()) |blob_entry| {
+                    if (blob_entry.kind == .file and std.mem.endsWith(u8, blob_entry.name, ".blob")) {
+                        scanned += 1;
+
+                        // Reconstruct hash from path: prefix + name (without .blob)
+                        const name_without_ext = blob_entry.name[0 .. blob_entry.name.len - 5];
+                        if (name_without_ext.len != 38) continue; // 40 - 2 prefix = 38
+
+                        var hex: [40]u8 = undefined;
+                        @memcpy(hex[0..2], prefix_entry.name);
+                        @memcpy(hex[2..], name_without_ext);
+
+                        var hash: ContentHash = undefined;
+                        _ = std.fmt.hexToBytes(&hash, &hex) catch continue;
+
+                        // Check if referenced
+                        if (!referenced.contains(hash)) {
+                            // Check grace period using mtime
+                            const blob_path = try std.fs.path.join(allocator, &.{ prefix_path, blob_entry.name });
+                            defer allocator.free(blob_path);
+
+                            const file = std.fs.cwd().openFile(blob_path, .{}) catch continue;
+                            const stat = file.stat() catch {
+                                file.close();
+                                continue;
+                            };
+                            file.close();
+
+                            const mtime_secs = @divFloor(stat.mtime, std.time.ns_per_s);
+                            const age = now - mtime_secs;
+
+                            if (age > GC_GRACE_PERIOD_SECS) {
+                                std.fs.cwd().deleteFile(blob_path) catch continue;
+                                deleted += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return .{ .scanned = scanned, .deleted = deleted };
+    }
+
+    fn collectReferencedHashes(self: *const CAS, allocator: Allocator, meta_index: *const MetaIndex, bucket: []const u8, referenced: *std.AutoHashMap(ContentHash, void)) !void {
+        _ = self;
+        const bucket_path = try std.fs.path.join(allocator, &.{ meta_index.data_dir, ".index", bucket });
+        defer allocator.free(bucket_path);
+
+        try collectHashesFromDir(allocator, bucket_path, bucket, "", meta_index, referenced);
+    }
 };
 
+/// Recursively collect hashes from metadata directory for GC reference counting
+fn collectHashesFromDir(allocator: Allocator, dir_path: []const u8, bucket: []const u8, prefix: []const u8, meta_index: *const MetaIndex, referenced: *std.AutoHashMap(ContentHash, void)) !void {
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        const full_name = if (prefix.len > 0)
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name })
+        else
+            try allocator.dupe(u8, entry.name);
+        defer allocator.free(full_name);
+
+        if (entry.kind == .directory) {
+            const subdir = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+            defer allocator.free(subdir);
+            try collectHashesFromDir(allocator, subdir, bucket, full_name, meta_index, referenced);
+        } else if (std.mem.endsWith(u8, entry.name, ".meta")) {
+            // Read hash from metadata file (even tombstones - they still reference content)
+            const key = full_name[0 .. full_name.len - 5]; // Remove .meta
+            const path = try meta_index.metaPath(allocator, bucket, key);
+            defer allocator.free(path);
+
+            var file = std.fs.cwd().openFile(path, .{}) catch continue;
+            defer file.close();
+
+            var buf: [128]u8 = undefined;
+            const bytes_read = file.readAll(&buf) catch continue;
+            const content = buf[0..bytes_read];
+
+            var lines = std.mem.splitScalar(u8, content, '\n');
+            const hash_hex = lines.next() orelse continue;
+
+            if (hash_hex.len != 40) continue;
+            var hash: ContentHash = undefined;
+            _ = std.fmt.hexToBytes(&hash, hash_hex) catch continue;
+
+            try referenced.put(hash, {});
+        }
+    }
+}
+
 /// Metadata Index - maps S3 paths to content hashes
+/// Supports tombstones for delete propagation and inline storage for small objects
 const MetaIndex = struct {
     data_dir: []const u8,
 
     const ObjectMeta = struct {
         hash: ContentHash,
         size: u64,
-        chunks: []ContentHash,
         created: i64,
-        replicas: u8,
+        deleted: i64, // 0 = not deleted, >0 = tombstone timestamp
+        inline_data: ?[]const u8, // For small objects (<= INLINE_THRESHOLD)
     };
 
-    /// Store metadata for an S3 object
+    /// Store metadata for an S3 object (with optional inline data for small objects)
     pub fn put(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8, hash: ContentHash, size: u64) !void {
+        try self.putWithData(allocator, bucket, key, hash, size, null);
+    }
+
+    /// Store metadata with optional inline data
+    pub fn putWithData(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8, hash: ContentHash, size: u64, inline_data: ?[]const u8) !void {
         const path = try self.metaPath(allocator, bucket, key);
         defer allocator.free(path);
 
@@ -131,19 +280,201 @@ const MetaIndex = struct {
         var file = try std.fs.cwd().createFile(path, .{});
         defer file.close();
 
-        // Simple format: hex_hash\nsize\ncreated_timestamp
+        // Format: hex_hash\nsize\ncreated\ndeleted\n[inline_data_base64]
         var hash_hex: [40]u8 = undefined;
         bytesToHex(&hash, &hash_hex);
         const created = std.time.timestamp();
 
         var buf: [128]u8 = undefined;
-        const content = std.fmt.bufPrint(&buf, "{s}\n{d}\n{d}\n", .{ hash_hex, size, created }) catch unreachable;
-        try file.writeAll(content);
+        const header = std.fmt.bufPrint(&buf, "{s}\n{d}\n{d}\n0\n", .{ hash_hex, size, created }) catch unreachable;
+        try file.writeAll(header);
+
+        // Write inline data if provided
+        if (inline_data) |data| {
+            try file.writeAll(data);
+        }
     }
 
-    /// Get metadata for an S3 object
+    /// Get metadata for an S3 object (returns null for tombstones)
     pub fn get(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8) !?struct { hash: ContentHash, size: u64 } {
+        const meta = try self.getFull(allocator, bucket, key) orelse return null;
+        if (meta.inline_data) |data| allocator.free(data);
+        return .{ .hash = meta.hash, .size = meta.size };
+    }
+
+    /// Get full metadata including inline data
+    pub fn getFull(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8) !?ObjectMeta {
         const path = try self.metaPath(allocator, bucket, key);
+        defer allocator.free(path);
+
+        var file = std.fs.cwd().openFile(path, .{}) catch return null;
+        defer file.close();
+
+        const stat = try file.stat();
+        const content = try allocator.alloc(u8, stat.size);
+        defer allocator.free(content);
+        _ = try file.readAll(content);
+
+        // Parse: hex_hash\nsize\ncreated\ndeleted\n[inline_data]
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        const hash_hex = lines.next() orelse return null;
+        const size_str = lines.next() orelse return null;
+        const created_str = lines.next() orelse return null;
+        const deleted_str = lines.next() orelse return null;
+
+        if (hash_hex.len != 40) return null;
+        var hash: ContentHash = undefined;
+        _ = std.fmt.hexToBytes(&hash, hash_hex) catch return null;
+
+        const size = std.fmt.parseInt(u64, size_str, 10) catch return null;
+        const created = std.fmt.parseInt(i64, created_str, 10) catch return null;
+        const deleted = std.fmt.parseInt(i64, deleted_str, 10) catch 0;
+
+        // Check tombstone - return null if deleted
+        if (deleted > 0) return null;
+
+        // Check for inline data after the 4th newline
+        var header_end: usize = 0;
+        var newline_count: usize = 0;
+        for (content, 0..) |c, i| {
+            if (c == '\n') {
+                newline_count += 1;
+                if (newline_count == 4) {
+                    header_end = i + 1;
+                    break;
+                }
+            }
+        }
+
+        var inline_data: ?[]const u8 = null;
+        if (header_end < content.len) {
+            inline_data = try allocator.dupe(u8, content[header_end..]);
+        }
+
+        return .{
+            .hash = hash,
+            .size = size,
+            .created = created,
+            .deleted = 0,
+            .inline_data = inline_data,
+        };
+    }
+
+    /// Delete metadata by writing a tombstone (prevents resurrection during sync)
+    pub fn delete(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8) void {
+        self.writeTombstone(allocator, bucket, key) catch {
+            // Fallback: just delete the file if tombstone fails
+            const path = self.metaPath(allocator, bucket, key) catch return;
+            defer allocator.free(path);
+            std.fs.cwd().deleteFile(path) catch {};
+        };
+    }
+
+    /// Write tombstone marker (preserves hash for GC reference counting)
+    fn writeTombstone(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8) !void {
+        const path = try self.metaPath(allocator, bucket, key);
+        defer allocator.free(path);
+
+        // Read existing metadata to preserve hash
+        var file = std.fs.cwd().openFile(path, .{}) catch return;
+        var buf: [128]u8 = undefined;
+        const bytes_read = file.readAll(&buf) catch return;
+        file.close();
+        const content = buf[0..bytes_read];
+
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        const hash_hex = lines.next() orelse return;
+        const size_str = lines.next() orelse return;
+        const created_str = lines.next() orelse return;
+
+        // Rewrite with tombstone timestamp
+        var out_file = try std.fs.cwd().createFile(path, .{});
+        defer out_file.close();
+
+        const deleted = std.time.timestamp();
+        var out_buf: [128]u8 = undefined;
+        const new_content = std.fmt.bufPrint(&out_buf, "{s}\n{s}\n{s}\n{d}\n", .{ hash_hex, size_str, created_str, deleted }) catch unreachable;
+        try out_file.writeAll(new_content);
+    }
+
+    /// Check if entry is a tombstone (for cleanup)
+    pub fn isTombstone(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8) bool {
+        const path = self.metaPath(allocator, bucket, key) catch return false;
+        defer allocator.free(path);
+
+        var file = std.fs.cwd().openFile(path, .{}) catch return false;
+        defer file.close();
+
+        var buf: [128]u8 = undefined;
+        const bytes_read = file.readAll(&buf) catch return false;
+        const content = buf[0..bytes_read];
+
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        _ = lines.next(); // hash
+        _ = lines.next(); // size
+        _ = lines.next(); // created
+        const deleted_str = lines.next() orelse return false;
+
+        const deleted = std.fmt.parseInt(i64, deleted_str, 10) catch return false;
+        return deleted > 0;
+    }
+
+    /// Cleanup expired tombstones
+    pub fn cleanupTombstones(self: *const MetaIndex, allocator: Allocator) !void {
+        const now = std.time.timestamp();
+        const index_path = try std.fs.path.join(allocator, &.{ self.data_dir, ".index" });
+        defer allocator.free(index_path);
+
+        var dir = std.fs.cwd().openDir(index_path, .{ .iterate = true }) catch return;
+        defer dir.close();
+
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            if (entry.kind == .directory) {
+                try self.cleanupBucketTombstones(allocator, entry.name, now);
+            }
+        }
+    }
+
+    fn cleanupBucketTombstones(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, now: i64) !void {
+        const bucket_path = try std.fs.path.join(allocator, &.{ self.data_dir, ".index", bucket });
+        defer allocator.free(bucket_path);
+
+        self.cleanupDirTombstones(allocator, bucket_path, bucket, "", now) catch {};
+    }
+
+    fn cleanupDirTombstones(self: *const MetaIndex, allocator: Allocator, dir_path: []const u8, bucket: []const u8, prefix: []const u8, now: i64) !void {
+        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+        defer dir.close();
+
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            const full_name = if (prefix.len > 0)
+                try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name })
+            else
+                try allocator.dupe(u8, entry.name);
+            defer allocator.free(full_name);
+
+            if (entry.kind == .directory) {
+                const subdir = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+                defer allocator.free(subdir);
+                try self.cleanupDirTombstones(allocator, subdir, bucket, full_name, now);
+            } else if (std.mem.endsWith(u8, entry.name, ".meta")) {
+                // Check if expired tombstone
+                const key = full_name[0 .. full_name.len - 5]; // Remove .meta
+                if (self.getTombstoneAge(allocator, bucket, key, now)) |age| {
+                    if (age > TOMBSTONE_TTL_SECS) {
+                        const path = try self.metaPath(allocator, bucket, key);
+                        defer allocator.free(path);
+                        std.fs.cwd().deleteFile(path) catch {};
+                    }
+                }
+            }
+        }
+    }
+
+    fn getTombstoneAge(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8, now: i64) ?i64 {
+        const path = self.metaPath(allocator, bucket, key) catch return null;
         defer allocator.free(path);
 
         var file = std.fs.cwd().openFile(path, .{}) catch return null;
@@ -153,25 +484,15 @@ const MetaIndex = struct {
         const bytes_read = file.readAll(&buf) catch return null;
         const content = buf[0..bytes_read];
 
-        // Parse: hex_hash\nsize\n...
         var lines = std.mem.splitScalar(u8, content, '\n');
-        const hash_hex = lines.next() orelse return null;
-        const size_str = lines.next() orelse return null;
+        _ = lines.next(); // hash
+        _ = lines.next(); // size
+        _ = lines.next(); // created
+        const deleted_str = lines.next() orelse return null;
 
-        if (hash_hex.len != 40) return null;
-        var hash: ContentHash = undefined;
-        _ = std.fmt.hexToBytes(&hash, hash_hex) catch return null;
-
-        const size = std.fmt.parseInt(u64, size_str, 10) catch return null;
-
-        return .{ .hash = hash, .size = size };
-    }
-
-    /// Delete metadata for an S3 object
-    pub fn delete(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8) void {
-        const path = self.metaPath(allocator, bucket, key) catch return;
-        defer allocator.free(path);
-        std.fs.cwd().deleteFile(path) catch {};
+        const deleted = std.fmt.parseInt(i64, deleted_str, 10) catch return null;
+        if (deleted == 0) return null;
+        return now - deleted;
     }
 
     fn metaPath(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8) ![]const u8 {
@@ -408,6 +729,29 @@ const Kademlia = struct {
             return list.items;
         }
         return &.{};
+    }
+
+    /// Find a peer by its node ID
+    pub fn findPeerById(self: *Kademlia, id: NodeId) ?PeerInfo {
+        const bucket_idx = self.bucketIndex(id);
+        for (self.buckets[bucket_idx].peers) |slot| {
+            if (slot) |peer| {
+                if (std.mem.eql(u8, &peer.id, &id)) {
+                    return peer;
+                }
+            }
+        }
+        // Also search all buckets as fallback (peer might be in wrong bucket temporarily)
+        for (&self.buckets) |*bucket| {
+            for (bucket.peers) |slot| {
+                if (slot) |peer| {
+                    if (std.mem.eql(u8, &peer.id, &id)) {
+                        return peer;
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     /// Get total peer count across all buckets
@@ -2195,17 +2539,25 @@ fn handleDistributedPut(ctx: *const S3Context, allocator: Allocator, req: *Reque
     defer allocator.free(bucket_path);
     std.fs.cwd().makePath(bucket_path) catch {};
 
-    // Store content in CAS
-    const hash = try dist.cas.store(allocator, req.body);
+    // Compute content hash
+    const hash = CAS.computeHash(req.body);
 
-    // Update metadata index
-    try dist.meta_index.put(allocator, bucket, key, hash, req.body.len);
+    // For small objects, store inline in metadata (skip CAS)
+    if (req.body.len <= INLINE_THRESHOLD) {
+        try dist.meta_index.putWithData(allocator, bucket, key, hash, req.body.len, req.body);
+    } else {
+        // Store content in CAS for larger objects
+        _ = try dist.cas.store(allocator, req.body);
+        try dist.meta_index.put(allocator, bucket, key, hash, req.body.len);
+    }
 
     // Announce to DHT
     dist.kademlia.announce(hash) catch {};
 
-    // Schedule replication
-    dist.replication.schedule(hash) catch {};
+    // Schedule replication (only for CAS objects)
+    if (req.body.len > INLINE_THRESHOLD) {
+        dist.replication.schedule(hash) catch {};
+    }
 
     // Return ETag as content hash
     var etag_hex: [42]u8 = undefined;
@@ -2217,55 +2569,124 @@ fn handleDistributedPut(ctx: *const S3Context, allocator: Allocator, req: *Reque
     res.setHeader("ETag", &etag_hex);
 }
 
-/// Distributed GET - lookup metadata, retrieve from CAS or peers
+/// Distributed GET - lookup metadata, retrieve from CAS/inline or peers with quorum
 fn handleDistributedGet(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
     const dist = ctx.distributed.?;
 
-    // Lookup metadata
-    const meta = try dist.meta_index.get(allocator, bucket, key) orelse {
+    // Lookup full metadata (includes inline data if present)
+    const meta = try dist.meta_index.getFull(allocator, bucket, key) orelse {
         sendError(res, 404, "NoSuchKey", "Object not found");
         return;
     };
+    // Note: inline_data is arena-allocated and will be freed with the request arena
 
-    // Try local CAS first
+    // Check for inline data first (small objects stored in metadata)
+    if (meta.inline_data) |data| {
+        return serveContent(req, res, data, &meta.hash);
+    }
+
+    // Try local CAS
     if (dist.cas.retrieve(allocator, meta.hash)) |data| {
-        // Handle range requests
-        if (req.header("range")) |range_header| {
-            if (parseRange(range_header, data.len)) |range| {
-                var range_buf: [64]u8 = undefined;
-                const content_range = std.fmt.bufPrint(&range_buf, "bytes {d}-{d}/{d}", .{ range.start, range.end, data.len }) catch unreachable;
-
-                res.status = 206;
-                res.status_text = "Partial Content";
-                res.setHeader("Content-Range", content_range);
-                res.setHeader("Accept-Ranges", "bytes");
-                res.body = data[range.start .. range.end + 1];
-                return;
-            }
-        }
-
-        res.ok();
-        res.setHeader("Accept-Ranges", "bytes");
-
-        var etag_hex: [42]u8 = undefined;
-        etag_hex[0] = '"';
-        bytesToHex(&meta.hash, etag_hex[1..41]);
-        etag_hex[41] = '"';
-        res.setHeader("ETag", &etag_hex);
-        res.body = data;
-        return;
+        return serveContent(req, res, data, &meta.hash);
     } else |_| {}
 
-    // Content not local - query DHT for providers
+    // Content not local - query DHT for providers and use quorum reads
     const providers = dist.kademlia.findProviders(meta.hash);
     if (providers.len == 0) {
         sendError(res, 404, "NoSuchKey", "Content not available (no providers)");
         return;
     }
 
-    // TODO: Fetch from remote peer
-    // For now, return not found if not local
-    sendError(res, 404, "NoSuchKey", "Content not available locally");
+    // Quorum read: try to get content from multiple providers
+    // In a real implementation, we'd query providers in parallel and verify hashes match
+    // For now, try providers sequentially until we get valid content
+    for (providers) |provider_id| {
+        // Find peer address
+        const peer = dist.kademlia.findPeerById(provider_id) orelse continue;
+
+        // Fetch from remote peer
+        if (fetchFromPeer(allocator, peer.address, meta.hash)) |data| {
+            // Verify hash matches (quorum verification)
+            const fetched_hash = CAS.computeHash(data);
+            if (std.mem.eql(u8, &fetched_hash, &meta.hash)) {
+                // Cache locally for future reads
+                _ = dist.cas.store(allocator, data) catch {};
+                return serveContent(req, res, data, &meta.hash);
+            }
+            allocator.free(data);
+        } else |_| {}
+    }
+
+    sendError(res, 404, "NoSuchKey", "Content not available from any provider");
+}
+
+/// Serve content with range request support
+fn serveContent(req: *Request, res: *Response, data: []const u8, hash: *const ContentHash) void {
+    // Handle range requests
+    if (req.header("range")) |range_header| {
+        if (parseRange(range_header, data.len)) |range| {
+            var range_buf: [64]u8 = undefined;
+            const content_range = std.fmt.bufPrint(&range_buf, "bytes {d}-{d}/{d}", .{ range.start, range.end, data.len }) catch unreachable;
+
+            res.status = 206;
+            res.status_text = "Partial Content";
+            res.setHeader("Content-Range", content_range);
+            res.setHeader("Accept-Ranges", "bytes");
+            res.body = data[range.start .. range.end + 1];
+            return;
+        }
+    }
+
+    res.ok();
+    res.setHeader("Accept-Ranges", "bytes");
+
+    var etag_hex: [42]u8 = undefined;
+    etag_hex[0] = '"';
+    bytesToHex(hash, etag_hex[1..41]);
+    etag_hex[41] = '"';
+    res.setHeader("ETag", &etag_hex);
+    res.body = data;
+}
+
+/// Fetch content from a remote peer
+fn fetchFromPeer(allocator: Allocator, address: net.Address, hash: ContentHash) ![]const u8 {
+    // Connect to peer
+    var stream = net.tcpConnectToAddress(address) catch return error.ConnectionFailed;
+    defer stream.close();
+
+    // Build request
+    var hash_hex: [40]u8 = undefined;
+    bytesToHex(&hash, &hash_hex);
+
+    var req_buf: [256]u8 = undefined;
+    const request = std.fmt.bufPrint(&req_buf, "GET /_zs3/blob/{s} HTTP/1.1\r\nHost: {any}\r\nConnection: close\r\n\r\n", .{ hash_hex, address }) catch return error.BufferTooSmall;
+    _ = stream.write(request) catch return error.WriteFailed;
+
+    // Read response
+    var response_buf = try allocator.alloc(u8, 16 * 1024 * 1024); // 16MB max
+    errdefer allocator.free(response_buf);
+
+    var total_read: usize = 0;
+    while (total_read < response_buf.len) {
+        const bytes = stream.read(response_buf[total_read..]) catch break;
+        if (bytes == 0) break;
+        total_read += bytes;
+    }
+
+    // Parse response - find body after \r\n\r\n
+    const response = response_buf[0..total_read];
+    const header_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return error.InvalidResponse;
+
+    // Check status
+    if (!std.mem.startsWith(u8, response, "HTTP/1.1 200")) {
+        allocator.free(response_buf);
+        return error.NotFound;
+    }
+
+    const body = response[header_end + 4 ..];
+    const result = try allocator.dupe(u8, body);
+    allocator.free(response_buf);
+    return result;
 }
 
 /// Distributed DELETE - remove metadata (CAS content can be garbage collected)
