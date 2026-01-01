@@ -1264,18 +1264,35 @@ fn parseRequestFromBuf(allocator: Allocator, data: []const u8, stream: net.Strea
         const content_length = std.fmt.parseInt(usize, cl_str, 10) catch 0;
         if (content_length > MAX_BODY_SIZE) return error.PayloadTooLarge;
         if (content_length > 0) {
-            const body_start_idx = std.mem.indexOf(u8, data, "\r\n\r\n").? + 4;
-            const already_read = total_read - body_start_idx;
-
-            const body_buf = try allocator.alloc(u8, content_length);
-            if (already_read > 0) {
-                @memcpy(body_buf[0..already_read], data[body_start_idx..total_read]);
+            // Handle Expect: 100-continue - send 100 Continue before reading body
+            if (headers.get("expect")) |expect| {
+                if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
+                    stream.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch {};
+                }
             }
 
-            var remaining = content_length - already_read;
-            var offset = already_read;
+            const body_start_idx = std.mem.indexOf(u8, data, "\r\n\r\n").? + 4;
+            // Ensure we don't underflow: already_read = max(0, total_read - body_start_idx)
+            const already_read = if (total_read > body_start_idx) total_read - body_start_idx else 0;
+            // Cap already_read to content_length to prevent overflow in memcpy
+            const bytes_to_copy = @min(already_read, content_length);
+
+            const body_buf = try allocator.alloc(u8, content_length);
+            if (bytes_to_copy > 0) {
+                @memcpy(body_buf[0..bytes_to_copy], data[body_start_idx .. body_start_idx + bytes_to_copy]);
+            }
+
+            var remaining = content_length - bytes_to_copy;
+            var offset = bytes_to_copy;
             while (remaining > 0) {
-                const n = stream.read(body_buf[offset..]) catch |err| return err;
+                const n = stream.read(body_buf[offset..]) catch |err| {
+                    // Handle non-blocking sockets - retry on WouldBlock
+                    if (err == error.WouldBlock) {
+                        std.Thread.sleep(1_000_000); // 1ms sleep before retry
+                        continue;
+                    }
+                    return err;
+                };
                 if (n == 0) break;
                 offset += n;
                 remaining -= n;
@@ -1751,10 +1768,10 @@ fn handlePutObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     // Use fast hash for ETag (wyhash is ~10x faster than SHA256)
     const hash = std.hash.Wyhash.hash(0, req.body);
     var etag_hex: [20]u8 = undefined;
-    _ = std.fmt.bufPrint(&etag_hex, "\"{x}\"", .{hash}) catch unreachable;
+    const etag = std.fmt.bufPrint(&etag_hex, "\"{x}\"", .{hash}) catch unreachable;
 
     res.ok();
-    res.setHeader("ETag", &etag_hex);
+    res.setHeader("ETag", etag);
 }
 
 fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
@@ -2176,12 +2193,12 @@ fn handleUploadPart(ctx: *const S3Context, allocator: Allocator, req: *Request, 
         return;
     };
 
-    const etag = SigV4.hash(req.body);
+    const etag_hash = SigV4.hash(req.body);
     var etag_hex: [66]u8 = undefined;
-    _ = std.fmt.bufPrint(&etag_hex, "\"{x}\"", .{etag}) catch unreachable;
+    const etag = std.fmt.bufPrint(&etag_hex, "\"{x}\"", .{etag_hash}) catch unreachable;
 
     res.ok();
-    res.setHeader("ETag", &etag_hex);
+    res.setHeader("ETag", etag);
 }
 
 fn handleCompleteMultipart(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
