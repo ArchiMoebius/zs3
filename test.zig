@@ -12,6 +12,7 @@ const xmlEscape = main.xmlEscape;
 const SigV4 = main.SigV4;
 const formatHttpDate = main.formatHttpDate;
 const formatIso8601 = main.formatIso8601;
+const decodeAwsChunked = main.decodeAwsChunked;
 
 test "isValidBucketName" {
     try std.testing.expect(isValidBucketName("mybucket"));
@@ -324,4 +325,36 @@ test "formatIso8601 - output length is exactly 20 bytes" {
     try std.testing.expectEqual(@as(u8, ':'), buf[13]);
     try std.testing.expectEqual(@as(u8, ':'), buf[16]);
     try std.testing.expectEqual(@as(u8, 'Z'), buf[19]);
+}
+
+test "decodeAwsChunked - single chunk" {
+    const allocator = std.testing.allocator;
+    const input = "5;chunk-signature=abc123\r\nhello\r\n0;chunk-signature=def456\r\n\r\n";
+    const result = try decodeAwsChunked(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("hello", result);
+}
+
+test "decodeAwsChunked - multiple chunks" {
+    const allocator = std.testing.allocator;
+    const input = "5;chunk-signature=abc\r\nhello\r\n6;chunk-signature=def\r\n world\r\n0;chunk-signature=end\r\n\r\n";
+    const result = try decodeAwsChunked(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("hello world", result);
+}
+
+test "decodeAwsChunked - empty body (zero-size chunk only)" {
+    const allocator = std.testing.allocator;
+    const input = "0;chunk-signature=abc\r\n\r\n";
+    const result = try decodeAwsChunked(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "decodeAwsChunked - hex size uppercase" {
+    const allocator = std.testing.allocator;
+    const input = "A;chunk-signature=sig\r\n0123456789\r\n0;chunk-signature=end\r\n\r\n";
+    const result = try decodeAwsChunked(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("0123456789", result);
 }

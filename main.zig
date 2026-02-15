@@ -70,6 +70,38 @@ pub fn formatIso8601(buf: *[20]u8, timestamp: i64) void {
     }) catch unreachable;
 }
 
+/// Decode AWS chunked transfer encoding.
+/// Format: <hex-size>;chunk-signature=...\r\n<data>\r\n repeated, terminated by 0-size chunk.
+pub fn decodeAwsChunked(allocator: Allocator, body: []const u8) ![]const u8 {
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer result.deinit(allocator);
+
+    var pos: usize = 0;
+    while (pos < body.len) {
+        // Find the end of the chunk header line (terminated by \r\n)
+        const line_end = std.mem.indexOfPos(u8, body, pos, "\r\n") orelse break;
+        const chunk_header = body[pos..line_end];
+
+        // Parse hex chunk size (before the first ';')
+        const size_end = std.mem.indexOf(u8, chunk_header, ";") orelse chunk_header.len;
+        const hex_str = chunk_header[0..size_end];
+        const chunk_size = std.fmt.parseInt(usize, hex_str, 16) catch break;
+
+        if (chunk_size == 0) break;
+
+        // Data starts after \r\n
+        const data_start = line_end + 2;
+        if (data_start + chunk_size > body.len) break;
+
+        try result.appendSlice(allocator, body[data_start .. data_start + chunk_size]);
+
+        // Skip past data + \r\n
+        pos = data_start + chunk_size + 2;
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
 /// Heap-allocate an RFC 7231 date string suitable for Response.setHeader.
 fn allocHttpDate(allocator: Allocator, timestamp: i64) ![]const u8 {
     var buf: [29]u8 = undefined;
@@ -1274,12 +1306,22 @@ const Response = struct {
             // Use sendfile for zero-copy transfer
             if (builtin.os.tag == .macos) {
                 var offset: i64 = @intCast(self.send_file_offset);
-                var len: i64 = @intCast(self.send_file_size);
-                while (len > 0) {
+                var remaining: usize = self.send_file_size;
+                while (remaining > 0) {
+                    var len: i64 = @intCast(remaining);
                     const rc = std.c.sendfile(file.handle, stream.handle, offset, &len, null, 0);
-                    if (rc == -1) break;
-                    offset += len;
-                    len = @intCast(self.send_file_size - @as(usize, @intCast(offset - @as(i64, @intCast(self.send_file_offset)))));
+                    if (len > 0) {
+                        offset += len;
+                        remaining -= @intCast(len);
+                    }
+                    if (rc == -1) {
+                        const e = std.c._errno().*;
+                        if (e == @intFromEnum(std.posix.E.AGAIN) or e == @intFromEnum(std.posix.E.INTR)) {
+                            std.Thread.sleep(1_000_000); // 1ms
+                            continue;
+                        }
+                        break;
+                    }
                 }
             } else if (builtin.os.tag == .linux) {
                 var offset: i64 = @intCast(self.send_file_offset);
@@ -1292,7 +1334,19 @@ const Response = struct {
                 }
             }
         } else if (self.body.len > 0) {
-            try stream.writeAll(self.body);
+            // Custom write loop to handle WouldBlock on non-blocking sockets
+            var written: usize = 0;
+            while (written < self.body.len) {
+                const n = posix.write(stream.handle, self.body[written..]) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        std.Thread.sleep(1_000_000); // 1ms
+                        continue;
+                    },
+                    else => return err,
+                };
+                if (n == 0) return error.ConnectionResetByPeer;
+                written += n;
+            }
         }
     }
 };
@@ -1366,6 +1420,14 @@ fn parseRequestFromBuf(allocator: Allocator, data: []const u8, stream: net.Strea
                 remaining -= n;
             }
             body = body_buf;
+
+            // Decode AWS chunked transfer encoding if present
+            if (headers.get("x-amz-content-sha256")) |sha| {
+                if (std.mem.eql(u8, sha, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")) {
+                    const decoded = try decodeAwsChunked(allocator, body);
+                    body = decoded;
+                }
+            }
         }
     }
 
@@ -2068,8 +2130,10 @@ fn handleListObjects(ctx: *const S3Context, allocator: Allocator, req: *Request,
     const max_keys = std.fmt.parseInt(usize, max_keys_str, 10) catch 1000;
 
     const delimiter_raw = getQueryParam(req.query, "delimiter");
-    const delimiter = if (delimiter_raw) |d| try uriDecode(allocator, d) else null;
-    defer if (delimiter) |d| allocator.free(d);
+    const delimiter_decoded = if (delimiter_raw) |d| try uriDecode(allocator, d) else null;
+    defer if (delimiter_decoded) |d| allocator.free(d);
+    // Treat empty delimiter the same as no delimiter
+    const delimiter = if (delimiter_decoded) |d| (if (d.len > 0) d else null) else null;
 
     const continuation = getQueryParam(req.query, "continuation-token");
 
@@ -2913,8 +2977,9 @@ fn handleDistributedList(ctx: *const S3Context, allocator: Allocator, req: *Requ
     const max_keys = std.fmt.parseInt(usize, max_keys_str, 10) catch 1000;
 
     const delimiter_raw = getQueryParam(req.query, "delimiter");
-    const delimiter = if (delimiter_raw) |d| try uriDecode(allocator, d) else null;
-    defer if (delimiter) |d| allocator.free(d);
+    const delimiter_decoded = if (delimiter_raw) |d| try uriDecode(allocator, d) else null;
+    defer if (delimiter_decoded) |d| allocator.free(d);
+    const delimiter = if (delimiter_decoded) |d| (if (d.len > 0) d else null) else null;
 
     const continuation_raw = getQueryParam(req.query, "continuation-token");
     const continuation = if (continuation_raw) |c| try uriDecode(allocator, c) else null;
