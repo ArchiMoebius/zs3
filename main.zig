@@ -1128,7 +1128,6 @@ fn eventLoopEpoll(allocator: Allocator, ctx: *const S3Context, server: *net.Serv
 }
 
 fn eventLoopKqueue(allocator: Allocator, ctx: *const S3Context, server: *net.Server) !void {
-    @setRuntimeSafety(false);
     const c = std.c;
     const kq = c.kqueue();
     if (kq < 0) return error.Kqueue;
@@ -1273,7 +1272,7 @@ const Response = struct {
     }
 
     fn write(self: *Response, stream: net.Stream) !void {
-        var buf: [4096]u8 = undefined;
+        var buf: [8192]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
         const w = fbs.writer();
 
@@ -1441,19 +1440,25 @@ fn parseRequestFromBuf(allocator: Allocator, data: []const u8, stream: net.Strea
 }
 
 fn hasAuth(data: []const u8) bool {
-    @setRuntimeSafety(false);
     if (data.len < 14) return false;
+    const needle = "authorization:";
     const end = data.len - 13;
-    const ptr = data.ptr;
     var i: usize = 0;
     while (i < end) : (i += 1) {
-        const p = ptr + i;
-        if ((p[0] == 'A' or p[0] == 'a') and
-            (p[1] == 'u' or p[1] == 'U') and
-            p[2] == 't' and p[3] == 'h' and p[4] == 'o' and
-            p[5] == 'r' and p[6] == 'i' and p[7] == 'z' and
-            p[8] == 'a' and p[9] == 't' and p[10] == 'i' and
-            p[11] == 'o' and p[12] == 'n' and p[13] == ':')
+        if (std.ascii.toLower(data[i]) == needle[0] and
+            std.ascii.toLower(data[i + 1]) == needle[1] and
+            std.ascii.toLower(data[i + 2]) == needle[2] and
+            std.ascii.toLower(data[i + 3]) == needle[3] and
+            std.ascii.toLower(data[i + 4]) == needle[4] and
+            std.ascii.toLower(data[i + 5]) == needle[5] and
+            std.ascii.toLower(data[i + 6]) == needle[6] and
+            std.ascii.toLower(data[i + 7]) == needle[7] and
+            std.ascii.toLower(data[i + 8]) == needle[8] and
+            std.ascii.toLower(data[i + 9]) == needle[9] and
+            std.ascii.toLower(data[i + 10]) == needle[10] and
+            std.ascii.toLower(data[i + 11]) == needle[11] and
+            std.ascii.toLower(data[i + 12]) == needle[12] and
+            data[i + 13] == ':')
         {
             return true;
         }
@@ -1462,7 +1467,6 @@ fn hasAuth(data: []const u8) bool {
 }
 
 fn findHeaderEnd(data: []const u8) ?usize {
-    @setRuntimeSafety(false);
     if (data.len < 4) return null;
     const end = data.len - 3;
     const ptr = data.ptr;
@@ -1476,7 +1480,6 @@ fn findHeaderEnd(data: []const u8) ?usize {
 }
 
 fn handleConnectionWithStream(allocator: Allocator, ctx: *const S3Context, stream: net.Stream) !bool {
-    @setRuntimeSafety(false);
     var buf: [MAX_HEADER_SIZE]u8 = undefined;
     var total_read: usize = 0;
 
@@ -2093,7 +2096,7 @@ fn handleDeleteObjects(ctx: *const S3Context, allocator: Allocator, req: *Reques
             deleteObjectInternal(ctx, allocator, bucket, path);
 
             try xml.appendSlice(allocator, "<Deleted><Key>");
-            try xml.appendSlice(allocator, key);
+            try xmlEscape(allocator, &xml, key);
             try xml.appendSlice(allocator, "</Key></Deleted>");
         }
 
@@ -2189,9 +2192,9 @@ fn handleListObjects(ctx: *const S3Context, allocator: Allocator, req: *Request,
     try xml.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
     try xml.appendSlice(allocator, "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
     try xml.appendSlice(allocator, "<Name>");
-    try xml.appendSlice(allocator, bucket);
+    try xmlEscape(allocator, &xml, bucket);
     try xml.appendSlice(allocator, "</Name><Prefix>");
-    try xml.appendSlice(allocator, prefix);
+    try xmlEscape(allocator, &xml, prefix);
     try xml.appendSlice(allocator, "</Prefix><MaxKeys>");
     try xml.appendSlice(allocator, max_keys_str);
     try xml.appendSlice(allocator, "</MaxKeys>");
@@ -2238,7 +2241,7 @@ fn handleListObjects(ctx: *const S3Context, allocator: Allocator, req: *Request,
                 item.key;
 
             if (std.mem.indexOf(u8, after_prefix, delim)) |delim_idx| {
-                const common_prefix = item.key[0 .. prefix.len + delim_idx + 1];
+                const common_prefix = item.key[0 .. prefix.len + delim_idx + delim.len];
                 if (!common_prefixes.contains(common_prefix)) {
                     try common_prefixes.put(common_prefix, {});
                     try xml.appendSlice(allocator, "<CommonPrefixes><Prefix>");
@@ -2263,6 +2266,12 @@ fn handleListObjects(ctx: *const S3Context, allocator: Allocator, req: *Request,
         try xml.appendSlice(allocator, "</Size><StorageClass>STANDARD</StorageClass></Contents>");
         count += 1;
     }
+
+    var count_buf: [32]u8 = undefined;
+    const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{count}) catch "0";
+    try xml.appendSlice(allocator, "<KeyCount>");
+    try xml.appendSlice(allocator, count_str);
+    try xml.appendSlice(allocator, "</KeyCount>");
 
     if (is_truncated) {
         try xml.appendSlice(allocator, "<IsTruncated>true</IsTruncated>");
@@ -2312,8 +2321,9 @@ fn collectKeys(allocator: Allocator, base_path: []const u8, current_prefix: []co
         } else if (entry.kind == .file) {
             // Translate .folder_marker files back to keys ending with /
             const report_key = if (std.mem.endsWith(u8, full_key, ".folder_marker")) blk: {
+                const trimmed = try allocator.dupe(u8, full_key[0 .. full_key.len - ".folder_marker".len]);
                 allocator.free(full_key);
-                break :blk try allocator.dupe(u8, full_key[0 .. full_key.len - ".folder_marker".len]);
+                break :blk trimmed;
             } else full_key;
 
             if (filter_prefix.len == 0 or std.mem.startsWith(u8, report_key, filter_prefix)) {
@@ -2399,7 +2409,15 @@ fn handleListBuckets(ctx: *const S3Context, allocator: Allocator, res: *Response
 
         try xml.appendSlice(allocator, "<Bucket><Name>");
         try xmlEscape(allocator, &xml, entry.name);
-        try xml.appendSlice(allocator, "</Name><CreationDate>2024-01-01T00:00:00.000Z</CreationDate></Bucket>");
+        try xml.appendSlice(allocator, "</Name><CreationDate>");
+        const mtime: i64 = blk: {
+            const stat = dir.statFile(entry.name) catch break :blk 0;
+            break :blk @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
+        };
+        var iso_buf: [20]u8 = undefined;
+        formatIso8601(&iso_buf, mtime);
+        try xml.appendSlice(allocator, &iso_buf);
+        try xml.appendSlice(allocator, "</CreationDate></Bucket>");
     }
 
     try xml.appendSlice(allocator, "</Buckets></ListAllMyBucketsResult>");
@@ -2475,8 +2493,7 @@ fn handleUploadPart(ctx: *const S3Context, allocator: Allocator, req: *Request, 
     };
 
     const etag_hash = SigV4.hash(req.body);
-    var etag_hex: [66]u8 = undefined;
-    const etag = std.fmt.bufPrint(&etag_hex, "\"{x}\"", .{etag_hash}) catch unreachable;
+    const etag = try std.fmt.allocPrint(allocator, "\"{x}\"", .{etag_hash});
 
     res.ok();
     res.setHeader("ETag", etag);
@@ -2617,11 +2634,12 @@ pub fn parseRange(header: []const u8, file_size: u64) ?Range {
     const start_str = range_spec[0..dash];
     const end_str = range_spec[dash + 1 ..];
 
-    // Suffix range: bytes=-N means last N bytes
+    // Suffix range: bytes=-N means last N bytes (clamp to file size per RFC 7233)
     if (start_str.len == 0 and end_str.len > 0) {
         const suffix_len = std.fmt.parseInt(u64, end_str, 10) catch return null;
-        if (suffix_len == 0 or suffix_len > file_size) return null;
-        return .{ .start = file_size - suffix_len, .end = file_size - 1 };
+        if (suffix_len == 0) return null;
+        const actual = @min(suffix_len, file_size);
+        return .{ .start = file_size - actual, .end = file_size - 1 };
     }
 
     const start = if (start_str.len > 0) std.fmt.parseInt(u64, start_str, 10) catch return null else 0;
@@ -2633,8 +2651,10 @@ pub fn parseRange(header: []const u8, file_size: u64) ?Range {
 
 pub fn hasQuery(query: []const u8, key: []const u8) bool {
     if (std.mem.indexOf(u8, query, key)) |idx| {
-        if (idx == 0) return true;
-        if (query[idx - 1] == '&') return true;
+        const at_start = (idx == 0) or (query[idx - 1] == '&');
+        const end = idx + key.len;
+        const at_end = (end == query.len) or (query[end] == '&') or (query[end] == '=');
+        if (at_start and at_end) return true;
     }
     return false;
 }
@@ -2686,8 +2706,7 @@ fn handlePeerProtocol(ctx: *const S3Context, dist: *DistributedContext, allocato
         try json.appendSlice(allocator, "[");
 
         var peers: [20]PeerInfo = undefined;
-        var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
-        const count = dist.kademlia.getRandomPeers(&peers, prng.random());
+        const count = dist.kademlia.getRandomPeers(&peers, std.crypto.random);
 
         for (peers[0..count], 0..) |peer, i| {
             if (i > 0) try json.appendSlice(allocator, ",");
@@ -2870,13 +2889,10 @@ fn handleDistributedPut(ctx: *const S3Context, allocator: Allocator, req: *Reque
     }
 
     // Return ETag as content hash
-    var etag_hex: [42]u8 = undefined;
-    etag_hex[0] = '"';
-    bytesToHex(&hash, etag_hex[1..41]);
-    etag_hex[41] = '"';
+    const etag = try std.fmt.allocPrint(allocator, "\"{x}\"", .{hash});
 
     res.ok();
-    res.setHeader("ETag", &etag_hex);
+    res.setHeader("ETag", etag);
 }
 
 /// Distributed GET - lookup metadata, retrieve from CAS/inline or peers with quorum
@@ -2982,7 +2998,7 @@ fn fetchFromPeer(allocator: Allocator, address: net.Address, hash: ContentHash) 
     _ = stream.write(request) catch return error.WriteFailed;
 
     // Read response
-    var response_buf = try allocator.alloc(u8, 16 * 1024 * 1024); // 16MB max
+    var response_buf = try allocator.alloc(u8, MAX_BODY_SIZE); // match standalone max
     errdefer allocator.free(response_buf);
 
     var total_read: usize = 0;
@@ -3045,9 +3061,9 @@ fn handleDistributedList(ctx: *const S3Context, allocator: Allocator, req: *Requ
     try xml.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
     try xml.appendSlice(allocator, "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
     try xml.appendSlice(allocator, "<Name>");
-    try xml.appendSlice(allocator, bucket);
+    try xmlEscape(allocator, &xml, bucket);
     try xml.appendSlice(allocator, "</Name><Prefix>");
-    try xml.appendSlice(allocator, prefix);
+    try xmlEscape(allocator, &xml, prefix);
     try xml.appendSlice(allocator, "</Prefix><MaxKeys>");
     try xml.appendSlice(allocator, max_keys_str);
     try xml.appendSlice(allocator, "</MaxKeys>");
@@ -3095,7 +3111,7 @@ fn handleDistributedList(ctx: *const S3Context, allocator: Allocator, req: *Requ
                 item.key;
 
             if (std.mem.indexOf(u8, after_prefix, delim)) |delim_idx| {
-                const common_prefix = item.key[0 .. prefix.len + delim_idx + 1];
+                const common_prefix = item.key[0 .. prefix.len + delim_idx + delim.len];
                 if (!common_prefixes.contains(common_prefix)) {
                     try common_prefixes.put(common_prefix, {});
                     try xml.appendSlice(allocator, "<CommonPrefixes><Prefix>");
@@ -3120,6 +3136,12 @@ fn handleDistributedList(ctx: *const S3Context, allocator: Allocator, req: *Requ
         try xml.appendSlice(allocator, "</Size><StorageClass>STANDARD</StorageClass></Contents>");
         count += 1;
     }
+
+    var count_buf: [32]u8 = undefined;
+    const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{count}) catch "0";
+    try xml.appendSlice(allocator, "<KeyCount>");
+    try xml.appendSlice(allocator, count_str);
+    try xml.appendSlice(allocator, "</KeyCount>");
 
     if (is_truncated) {
         try xml.appendSlice(allocator, "<IsTruncated>true</IsTruncated>");

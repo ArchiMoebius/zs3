@@ -61,6 +61,19 @@ test "parseRange" {
     try std.testing.expectEqual(@as(u64, 500), r3.?.start);
     try std.testing.expectEqual(@as(u64, 999), r3.?.end);
 
+    // Suffix range: last 100 bytes
+    const r4 = parseRange("bytes=-100", file_size);
+    try std.testing.expect(r4 != null);
+    try std.testing.expectEqual(@as(u64, 900), r4.?.start);
+    try std.testing.expectEqual(@as(u64, 999), r4.?.end);
+
+    // Suffix range larger than file size: clamp to entire file (RFC 7233)
+    const r5 = parseRange("bytes=-2000", file_size);
+    try std.testing.expect(r5 != null);
+    try std.testing.expectEqual(@as(u64, 0), r5.?.start);
+    try std.testing.expectEqual(@as(u64, 999), r5.?.end);
+
+    try std.testing.expect(parseRange("bytes=-0", file_size) == null);
     try std.testing.expect(parseRange("bytes=1000-1000", file_size) == null);
     try std.testing.expect(parseRange("bytes=500-400", file_size) == null);
     try std.testing.expect(parseRange("invalid", file_size) == null);
