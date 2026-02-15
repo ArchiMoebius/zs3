@@ -7,6 +7,7 @@ const parseRange = main.parseRange;
 const hasQuery = main.hasQuery;
 const getQueryParam = main.getQueryParam;
 const uriEncode = main.uriEncode;
+const uriDecode = main.uriDecode;
 const sortQueryString = main.sortQueryString;
 const xmlEscape = main.xmlEscape;
 const SigV4 = main.SigV4;
@@ -41,6 +42,19 @@ test "isValidKey" {
     try std.testing.expect(!isValidKey("file\x00.txt"));
     try std.testing.expect(!isValidKey("file\x1f.txt"));
     try std.testing.expect(!isValidKey("file\x7f.txt"));
+
+    // Path traversal
+    try std.testing.expect(!isValidKey("../etc/passwd"));
+    try std.testing.expect(!isValidKey("folder/../../etc/passwd"));
+    try std.testing.expect(!isValidKey("a..b")); // any ".." is blocked
+    // Absolute paths
+    try std.testing.expect(!isValidKey("/etc/passwd"));
+    // Max length
+    try std.testing.expect(!isValidKey("a" ** 1025));
+    // Valid edge cases
+    try std.testing.expect(isValidKey("a" ** 1024));
+    try std.testing.expect(isValidKey("folder/subfolder/deep/file.txt"));
+    try std.testing.expect(isValidKey("file with spaces & special=chars.txt"));
 }
 
 test "parseRange" {
@@ -88,6 +102,13 @@ test "hasQuery" {
 
     try std.testing.expect(!hasQuery("myuploadId=123", "uploadId"));
     try std.testing.expect(!hasQuery("", "uploadId"));
+
+    // Right-boundary: key must end at '=', '&', or end-of-string
+    try std.testing.expect(!hasQuery("uploadIdFoo=123", "uploadId"));
+    try std.testing.expect(!hasQuery("uploadIds", "uploadId"));
+    try std.testing.expect(hasQuery("uploadId", "uploadId"));
+    try std.testing.expect(hasQuery("foo=bar&delete", "delete"));
+    try std.testing.expect(hasQuery("delete&foo=bar", "delete"));
 }
 
 test "getQueryParam" {
@@ -122,6 +143,62 @@ test "uriEncode" {
     const e5 = try uriEncode(allocator, "a/b/c", true);
     defer allocator.free(e5);
     try std.testing.expectEqualStrings("a%2Fb%2Fc", e5);
+}
+
+test "uriDecode" {
+    const allocator = std.testing.allocator;
+
+    const d1 = try uriDecode(allocator, "hello%20world");
+    defer allocator.free(d1);
+    try std.testing.expectEqualStrings("hello world", d1);
+
+    const d2 = try uriDecode(allocator, "a%2Fb%2Fc");
+    defer allocator.free(d2);
+    try std.testing.expectEqualStrings("a/b/c", d2);
+
+    const d3 = try uriDecode(allocator, "no+encoding+needed");
+    defer allocator.free(d3);
+    try std.testing.expectEqualStrings("no encoding needed", d3);
+
+    const d4 = try uriDecode(allocator, "already-plain");
+    defer allocator.free(d4);
+    try std.testing.expectEqualStrings("already-plain", d4);
+
+    // Empty string
+    const d5 = try uriDecode(allocator, "");
+    defer allocator.free(d5);
+    try std.testing.expectEqualStrings("", d5);
+
+    // Mixed encoded and plain
+    const d6 = try uriDecode(allocator, "key%3Dvalue%26foo");
+    defer allocator.free(d6);
+    try std.testing.expectEqualStrings("key=value&foo", d6);
+
+    // Lowercase hex
+    const d7 = try uriDecode(allocator, "%2f%2F");
+    defer allocator.free(d7);
+    try std.testing.expectEqualStrings("//", d7);
+
+    // Invalid percent encoding (not enough chars) - pass through
+    const d8 = try uriDecode(allocator, "abc%2");
+    defer allocator.free(d8);
+    try std.testing.expectEqualStrings("abc%2", d8);
+
+    // Invalid hex digits - pass through
+    const d9 = try uriDecode(allocator, "abc%GG");
+    defer allocator.free(d9);
+    try std.testing.expectEqualStrings("abc%GG", d9);
+}
+
+test "uriEncode and uriDecode roundtrip" {
+    const allocator = std.testing.allocator;
+
+    const original = "folder/file with spaces & special=chars.txt";
+    const encoded = try uriEncode(allocator, original, true);
+    defer allocator.free(encoded);
+    const decoded = try uriDecode(allocator, encoded);
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings(original, decoded);
 }
 
 test "sortQueryString" {
