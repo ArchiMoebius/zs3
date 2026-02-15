@@ -378,6 +378,7 @@ def test_list_operations(s3):
 # =============================================================================
 
 def test_range_requests(s3):
+    global skipped
     print("\n[Range Requests]")
     bucket = "test-range-ops"
     cleanup_bucket(s3, bucket)
@@ -419,7 +420,6 @@ def test_range_requests(s3):
     except Exception as e:
         # Server may not support suffix ranges
         print(f"  [SKIP] Range suffix -5 (not supported)")
-        global skipped
         skipped += 1
 
     # Range: prefix (from N to end)
@@ -647,6 +647,7 @@ def test_security(s3):
 # =============================================================================
 
 def test_edge_cases(s3):
+    global skipped
     print("\n[Edge Cases]")
     bucket = "test-edge-cases"
     cleanup_bucket(s3, bucket)

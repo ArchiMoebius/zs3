@@ -125,6 +125,15 @@ test "sortQueryString" {
     const s3 = try sortQueryString(allocator, "");
     defer allocator.free(s3);
     try std.testing.expectEqualStrings("", s3);
+
+    // Params without '=' should be normalized to 'key=' format
+    const s4 = try sortQueryString(allocator, "uploads");
+    defer allocator.free(s4);
+    try std.testing.expectEqualStrings("uploads=", s4);
+
+    const s5 = try sortQueryString(allocator, "delete");
+    defer allocator.free(s5);
+    try std.testing.expectEqualStrings("delete=", s5);
 }
 
 test "xmlEscape" {

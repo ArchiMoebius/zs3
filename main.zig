@@ -1728,10 +1728,10 @@ pub const SigV4 = struct {
         try result.appendSlice(allocator, req.method);
         try result.append(allocator, '\n');
 
+        // S3 uses single URI encoding — the path from the HTTP request line
+        // is already URI-encoded, so use it as-is (no double-encoding)
         const canonical_path = if (req.path.len == 0) "/" else req.path;
-        const encoded_path = try uriEncode(allocator, canonical_path, false);
-        defer allocator.free(encoded_path);
-        try result.appendSlice(allocator, encoded_path);
+        try result.appendSlice(allocator, canonical_path);
         try result.append(allocator, '\n');
 
         const sorted_query = try sortQueryString(allocator, req.query);
@@ -1894,10 +1894,23 @@ pub fn sortQueryString(allocator: Allocator, query: []const u8) ![]const u8 {
     var pairs: std.ArrayListUnmanaged([]const u8) = .empty;
     defer pairs.deinit(allocator);
 
+    var normalized: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (normalized.items) |n| allocator.free(n);
+        normalized.deinit(allocator);
+    }
+
     var iter = std.mem.splitScalar(u8, query, '&');
     while (iter.next()) |pair| {
         if (pair.len > 0) {
-            try pairs.append(allocator, pair);
+            // Normalize params without '=' to 'key=' format (required by SigV4)
+            if (std.mem.indexOf(u8, pair, "=") == null) {
+                const norm = try std.fmt.allocPrint(allocator, "{s}=", .{pair});
+                try normalized.append(allocator, norm);
+                try pairs.append(allocator, norm);
+            } else {
+                try pairs.append(allocator, pair);
+            }
         }
     }
 
@@ -1917,7 +1930,14 @@ pub fn sortQueryString(allocator: Allocator, query: []const u8) ![]const u8 {
 }
 
 fn handlePutObject(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
-    const path = try ctx.objectPath(allocator, bucket, key);
+    // Keys ending with '/' are folder markers — store as ".folder_marker" file
+    const effective_key = if (key.len > 0 and key[key.len - 1] == '/')
+        try std.fmt.allocPrint(allocator, "{s}.folder_marker", .{key})
+    else
+        try allocator.dupe(u8, key);
+    defer allocator.free(effective_key);
+
+    const path = try ctx.objectPath(allocator, bucket, effective_key);
     defer allocator.free(path);
 
     if (std.fs.path.dirname(path)) |dir| {
@@ -1947,7 +1967,12 @@ fn handlePutObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
 }
 
 fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
-    const path = try ctx.objectPath(allocator, bucket, key);
+    const effective_key = if (key.len > 0 and key[key.len - 1] == '/')
+        try std.fmt.allocPrint(allocator, "{s}.folder_marker", .{key})
+    else
+        try allocator.dupe(u8, key);
+    defer allocator.free(effective_key);
+    const path = try ctx.objectPath(allocator, bucket, effective_key);
     defer allocator.free(path);
 
     var file = std.fs.cwd().openFile(path, .{}) catch {
@@ -2010,7 +2035,12 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
 }
 
 fn handleDeleteObject(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8, key: []const u8) !void {
-    const path = try ctx.objectPath(allocator, bucket, key);
+    const effective_key = if (key.len > 0 and key[key.len - 1] == '/')
+        try std.fmt.allocPrint(allocator, "{s}.folder_marker", .{key})
+    else
+        try allocator.dupe(u8, key);
+    defer allocator.free(effective_key);
+    const path = try ctx.objectPath(allocator, bucket, effective_key);
     defer allocator.free(path);
 
     deleteObjectInternal(ctx, allocator, bucket, path);
@@ -2077,7 +2107,12 @@ fn handleDeleteObjects(ctx: *const S3Context, allocator: Allocator, req: *Reques
 }
 
 fn handleHeadObject(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8, key: []const u8) !void {
-    const path = try ctx.objectPath(allocator, bucket, key);
+    const effective_key = if (key.len > 0 and key[key.len - 1] == '/')
+        try std.fmt.allocPrint(allocator, "{s}.folder_marker", .{key})
+    else
+        try allocator.dupe(u8, key);
+    defer allocator.free(effective_key);
+    const path = try ctx.objectPath(allocator, bucket, effective_key);
     defer allocator.free(path);
 
     var file = std.fs.cwd().openFile(path, .{}) catch {
@@ -2135,7 +2170,9 @@ fn handleListObjects(ctx: *const S3Context, allocator: Allocator, req: *Request,
     // Treat empty delimiter the same as no delimiter
     const delimiter = if (delimiter_decoded) |d| (if (d.len > 0) d else null) else null;
 
-    const continuation = getQueryParam(req.query, "continuation-token");
+    const continuation_raw = getQueryParam(req.query, "continuation-token");
+    const continuation = if (continuation_raw) |c| try uriDecode(allocator, c) else null;
+    defer if (continuation) |c| allocator.free(c);
 
     const bucket_path = try ctx.bucketPath(allocator, bucket);
     defer allocator.free(bucket_path);
@@ -2174,7 +2211,7 @@ fn handleListObjects(ctx: *const S3Context, allocator: Allocator, req: *Request,
     if (continuation) |cont| {
         for (keys.items, 0..) |item, i| {
             if (std.mem.eql(u8, item.key, cont)) {
-                start_idx = i + 1;
+                start_idx = i;
                 break;
             }
         }
@@ -2273,15 +2310,21 @@ fn collectKeys(allocator: Allocator, base_path: []const u8, current_prefix: []co
             try collectKeys(allocator, base_path, full_key, filter_prefix, keys);
             allocator.free(full_key);
         } else if (entry.kind == .file) {
-            if (filter_prefix.len == 0 or std.mem.startsWith(u8, full_key, filter_prefix)) {
+            // Translate .folder_marker files back to keys ending with /
+            const report_key = if (std.mem.endsWith(u8, full_key, ".folder_marker")) blk: {
+                allocator.free(full_key);
+                break :blk try allocator.dupe(u8, full_key[0 .. full_key.len - ".folder_marker".len]);
+            } else full_key;
+
+            if (filter_prefix.len == 0 or std.mem.startsWith(u8, report_key, filter_prefix)) {
                 // Use statFile instead of open+stat+close - much faster
                 const size, const mtime = blk: {
                     const stat = dir.statFile(entry.name) catch break :blk .{ 0, @as(i64, 0) };
                     break :blk .{ stat.size, @as(i64, @intCast(@divFloor(stat.mtime, std.time.ns_per_s))) };
                 };
-                try keys.append(allocator, .{ .key = full_key, .size = size, .mtime = mtime });
+                try keys.append(allocator, .{ .key = report_key, .size = size, .mtime = mtime });
             } else {
-                allocator.free(full_key);
+                allocator.free(report_key);
             }
         }
     }
@@ -2573,6 +2616,13 @@ pub fn parseRange(header: []const u8, file_size: u64) ?Range {
     const dash = std.mem.indexOf(u8, range_spec, "-") orelse return null;
     const start_str = range_spec[0..dash];
     const end_str = range_spec[dash + 1 ..];
+
+    // Suffix range: bytes=-N means last N bytes
+    if (start_str.len == 0 and end_str.len > 0) {
+        const suffix_len = std.fmt.parseInt(u64, end_str, 10) catch return null;
+        if (suffix_len == 0 or suffix_len > file_size) return null;
+        return .{ .start = file_size - suffix_len, .end = file_size - 1 };
+    }
 
     const start = if (start_str.len > 0) std.fmt.parseInt(u64, start_str, 10) catch return null else 0;
     const end = if (end_str.len > 0) std.fmt.parseInt(u64, end_str, 10) catch return null else file_size - 1;
@@ -3018,7 +3068,7 @@ fn handleDistributedList(ctx: *const S3Context, allocator: Allocator, req: *Requ
     if (continuation) |cont| {
         for (keys.items, 0..) |item, i| {
             if (std.mem.eql(u8, item.key, cont)) {
-                start_idx = i + 1;
+                start_idx = i;
                 break;
             }
         }
