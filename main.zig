@@ -22,6 +22,52 @@ const QUORUM_SIZE = 2; // Need 2 matching responses for quorum reads
 
 const ERROR_403 = "HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\nDenied";
 
+/// Format a Unix timestamp (seconds) as an HTTP date (RFC 7231).
+/// Returns a 29-byte string like "Mon, 02 Jan 2006 15:04:05 GMT".
+pub fn formatHttpDate(buf: *[29]u8, timestamp: i64) void {
+    const secs: u64 = if (timestamp > 0) @intCast(timestamp) else 0;
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const day = es.getEpochDay();
+    const yd = day.calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+
+    const dow = @mod(@as(i32, @intCast(day.day)) + 4, 7); // epoch was Thursday=4
+    const day_names = [7]*const [3]u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    const month_names = [12]*const [3]u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    const mon_idx = @intFromEnum(md.month) - 1;
+
+    _ = std.fmt.bufPrint(buf, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+        day_names[@intCast(dow)],
+        md.day_index + 1,
+        month_names[mon_idx],
+        yd.year,
+        ds.getHoursIntoDay(),
+        ds.getMinutesIntoHour(),
+        ds.getSecondsIntoMinute(),
+    }) catch unreachable;
+}
+
+/// Format a Unix timestamp (seconds) as ISO 8601 for S3 XML responses.
+/// Returns a 20-byte string like "2006-01-02T15:04:05Z".
+pub fn formatIso8601(buf: *[20]u8, timestamp: i64) void {
+    const secs: u64 = if (timestamp > 0) @intCast(timestamp) else 0;
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const day = es.getEpochDay();
+    const yd = day.calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+
+    _ = std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        yd.year,
+        @intFromEnum(md.month),
+        md.day_index + 1,
+        ds.getHoursIntoDay(),
+        ds.getMinutesIntoHour(),
+        ds.getSecondsIntoMinute(),
+    }) catch unreachable;
+}
+
 // ============================================================================
 // DISTRIBUTED TYPES
 // ============================================================================
@@ -1844,6 +1890,9 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
         return;
     };
 
+    var date_buf: [29]u8 = undefined;
+    formatHttpDate(&date_buf, @intCast(@divFloor(stat.mtime, std.time.ns_per_s)));
+
     // For range requests, use sendFile without ETag (efficient for large files)
     if (req.header("range")) |range_header| {
         if (parseRange(range_header, stat.size)) |range| {
@@ -1856,6 +1905,7 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
             res.status_text = "Partial Content";
             res.setHeader("Content-Range", content_range);
             res.setHeader("Accept-Ranges", "bytes");
+            res.setHeader("Last-Modified", &date_buf);
             res.setSendFile(file, len, range.start);
             return;
         }
@@ -1878,6 +1928,7 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     res.ok();
     res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("ETag", etag);
+    res.setHeader("Last-Modified", &date_buf);
     res.body = content;
 }
 
@@ -1981,10 +2032,14 @@ fn handleHeadObject(ctx: *const S3Context, allocator: Allocator, res: *Response,
         return;
     };
 
+    var date_buf: [29]u8 = undefined;
+    formatHttpDate(&date_buf, @intCast(@divFloor(stat.mtime, std.time.ns_per_s)));
+
     res.ok();
     res.setHeader("Content-Length", len_str);
     res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("ETag", etag);
+    res.setHeader("Last-Modified", &date_buf);
 }
 
 fn handleListObjects(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8) !void {
@@ -2079,7 +2134,11 @@ fn handleListObjects(ctx: *const S3Context, allocator: Allocator, req: *Request,
 
         try xml.appendSlice(allocator, "<Contents><Key>");
         try xmlEscape(allocator, &xml, item.key);
-        try xml.appendSlice(allocator, "</Key><Size>");
+        try xml.appendSlice(allocator, "</Key><LastModified>");
+        var iso_buf: [20]u8 = undefined;
+        formatIso8601(&iso_buf, item.mtime);
+        try xml.appendSlice(allocator, &iso_buf);
+        try xml.appendSlice(allocator, "</LastModified><Size>");
         var size_buf: [32]u8 = undefined;
         const size_str = std.fmt.bufPrint(&size_buf, "{d}", .{item.size}) catch "0";
         try xml.appendSlice(allocator, size_str);
@@ -2107,6 +2166,7 @@ fn handleListObjects(ctx: *const S3Context, allocator: Allocator, req: *Request,
 const KeyInfo = struct {
     key: []const u8,
     size: u64,
+    mtime: i64, // Unix timestamp in seconds
 };
 
 fn collectKeys(allocator: Allocator, base_path: []const u8, current_prefix: []const u8, filter_prefix: []const u8, keys: *std.ArrayListUnmanaged(KeyInfo)) !void {
@@ -2134,11 +2194,11 @@ fn collectKeys(allocator: Allocator, base_path: []const u8, current_prefix: []co
         } else if (entry.kind == .file) {
             if (filter_prefix.len == 0 or std.mem.startsWith(u8, full_key, filter_prefix)) {
                 // Use statFile instead of open+stat+close - much faster
-                const size = blk: {
-                    const stat = dir.statFile(entry.name) catch break :blk 0;
-                    break :blk stat.size;
+                const size, const mtime = blk: {
+                    const stat = dir.statFile(entry.name) catch break :blk .{ 0, @as(i64, 0) };
+                    break :blk .{ stat.size, @as(i64, @intCast(@divFloor(stat.mtime, std.time.ns_per_s))) };
                 };
-                try keys.append(allocator, .{ .key = full_key, .size = size });
+                try keys.append(allocator, .{ .key = full_key, .size = size, .mtime = mtime });
             } else {
                 allocator.free(full_key);
             }
@@ -2701,12 +2761,12 @@ fn handleDistributedGet(ctx: *const S3Context, allocator: Allocator, req: *Reque
 
     // Check for inline data first (small objects stored in metadata)
     if (meta.inline_data) |data| {
-        return serveContent(req, res, data, &meta.hash);
+        return serveContent(req, res, data, &meta.hash, meta.created);
     }
 
     // Try local CAS
     if (dist.cas.retrieve(allocator, meta.hash)) |data| {
-        return serveContent(req, res, data, &meta.hash);
+        return serveContent(req, res, data, &meta.hash, meta.created);
     } else |_| {}
 
     // Content not local - query DHT for providers and use quorum reads
@@ -2730,7 +2790,7 @@ fn handleDistributedGet(ctx: *const S3Context, allocator: Allocator, req: *Reque
             if (std.mem.eql(u8, &fetched_hash, &meta.hash)) {
                 // Cache locally for future reads
                 _ = dist.cas.store(allocator, data) catch {};
-                return serveContent(req, res, data, &meta.hash);
+                return serveContent(req, res, data, &meta.hash, meta.created);
             }
             allocator.free(data);
         } else |_| {}
@@ -2740,7 +2800,10 @@ fn handleDistributedGet(ctx: *const S3Context, allocator: Allocator, req: *Reque
 }
 
 /// Serve content with range request support
-fn serveContent(req: *Request, res: *Response, data: []const u8, hash: *const ContentHash) void {
+fn serveContent(req: *Request, res: *Response, data: []const u8, hash: *const ContentHash, created: i64) void {
+    var date_buf: [29]u8 = undefined;
+    formatHttpDate(&date_buf, created);
+
     // Handle range requests
     if (req.header("range")) |range_header| {
         if (parseRange(range_header, data.len)) |range| {
@@ -2751,6 +2814,7 @@ fn serveContent(req: *Request, res: *Response, data: []const u8, hash: *const Co
             res.status_text = "Partial Content";
             res.setHeader("Content-Range", content_range);
             res.setHeader("Accept-Ranges", "bytes");
+            res.setHeader("Last-Modified", &date_buf);
             res.body = data[range.start .. range.end + 1];
             return;
         }
@@ -2764,6 +2828,7 @@ fn serveContent(req: *Request, res: *Response, data: []const u8, hash: *const Co
     bytesToHex(hash, etag_hex[1..41]);
     etag_hex[41] = '"';
     res.setHeader("ETag", &etag_hex);
+    res.setHeader("Last-Modified", &date_buf);
     res.body = data;
 }
 
@@ -2908,7 +2973,11 @@ fn handleDistributedList(ctx: *const S3Context, allocator: Allocator, req: *Requ
 
         try xml.appendSlice(allocator, "<Contents><Key>");
         try xmlEscape(allocator, &xml, item.key);
-        try xml.appendSlice(allocator, "</Key><Size>");
+        try xml.appendSlice(allocator, "</Key><LastModified>");
+        var iso_buf2: [20]u8 = undefined;
+        formatIso8601(&iso_buf2, item.mtime);
+        try xml.appendSlice(allocator, &iso_buf2);
+        try xml.appendSlice(allocator, "</LastModified><Size>");
         var size_buf: [32]u8 = undefined;
         const size_str = std.fmt.bufPrint(&size_buf, "{d}", .{item.size}) catch "0";
         try xml.appendSlice(allocator, size_str);
@@ -2963,12 +3032,13 @@ fn collectMetaKeys(allocator: Allocator, base_path: []const u8, current_prefix: 
                 const key = full_name[0..key_name_len];
 
                 if (filter_prefix.len == 0 or std.mem.startsWith(u8, key, filter_prefix)) {
-                    // Get size from metadata (returns null for tombstones)
-                    const meta = meta_index.get(allocator, bucket, key) catch null;
+                    // Get full metadata (returns null for tombstones)
+                    const meta = meta_index.getFull(allocator, bucket, key) catch null;
                     // Skip tombstoned entries - they shouldn't appear in listings
                     if (meta) |m| {
+                        if (m.inline_data) |data| allocator.free(data);
                         const key_copy = try allocator.dupe(u8, key);
-                        try keys.append(allocator, .{ .key = key_copy, .size = m.size });
+                        try keys.append(allocator, .{ .key = key_copy, .size = m.size, .mtime = m.created });
                     }
                 }
             }
@@ -2981,10 +3051,11 @@ fn collectMetaKeys(allocator: Allocator, base_path: []const u8, current_prefix: 
 fn handleDistributedHead(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8, key: []const u8) !void {
     const dist = ctx.distributed.?;
 
-    const meta = try dist.meta_index.get(allocator, bucket, key) orelse {
+    const meta = try dist.meta_index.getFull(allocator, bucket, key) orelse {
         sendError(res, 404, "NoSuchKey", "Object not found");
         return;
     };
+    if (meta.inline_data) |data| allocator.free(data);
 
     var size_buf: [32]u8 = undefined;
     const size_str = std.fmt.bufPrint(&size_buf, "{d}", .{meta.size}) catch unreachable;
@@ -2994,10 +3065,14 @@ fn handleDistributedHead(ctx: *const S3Context, allocator: Allocator, res: *Resp
     bytesToHex(&meta.hash, etag_hex[1..41]);
     etag_hex[41] = '"';
 
+    var date_buf: [29]u8 = undefined;
+    formatHttpDate(&date_buf, meta.created);
+
     res.ok();
     res.setHeader("Content-Length", size_str);
     res.setHeader("ETag", &etag_hex);
     res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Last-Modified", &date_buf);
 }
 
 fn sendError(res: *Response, status: u16, code: []const u8, message: []const u8) void {

@@ -10,6 +10,8 @@ const uriEncode = main.uriEncode;
 const sortQueryString = main.sortQueryString;
 const xmlEscape = main.xmlEscape;
 const SigV4 = main.SigV4;
+const formatHttpDate = main.formatHttpDate;
+const formatIso8601 = main.formatIso8601;
 
 test "isValidBucketName" {
     try std.testing.expect(isValidBucketName("mybucket"));
@@ -24,7 +26,7 @@ test "isValidBucketName" {
     try std.testing.expect(!isValidBucketName("bucket."));
     try std.testing.expect(!isValidBucketName("my_bucket"));
     try std.testing.expect(!isValidBucketName(""));
-    try std.testing.expect(isValidBucketName("MyBucket"));
+    try std.testing.expect(!isValidBucketName("MyBucket"));
 }
 
 test "isValidKey" {
@@ -173,4 +175,153 @@ test "SigV4.hmac" {
     var hex: [64]u8 = undefined;
     _ = std.fmt.bufPrint(&hex, "{x}", .{result}) catch unreachable;
     try std.testing.expectEqualStrings("6e9ef29b75fffc5b7abae527d58fdadb2fe42e7219011976917343065f58ed4a", &hex);
+}
+
+test "formatHttpDate - Unix epoch" {
+    var buf: [29]u8 = undefined;
+    formatHttpDate(&buf, 0);
+    try std.testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", &buf);
+}
+
+test "formatHttpDate - known date" {
+    // 2024-01-15 11:30:45 UTC (Monday)
+    var buf: [29]u8 = undefined;
+    formatHttpDate(&buf, 1705318245);
+    try std.testing.expectEqualStrings("Mon, 15 Jan 2024 11:30:45 GMT", &buf);
+}
+
+test "formatHttpDate - end of month" {
+    // 2023-12-31 23:59:59 UTC (Sunday)
+    var buf: [29]u8 = undefined;
+    formatHttpDate(&buf, 1704067199);
+    try std.testing.expectEqualStrings("Sun, 31 Dec 2023 23:59:59 GMT", &buf);
+}
+
+test "formatHttpDate - leap year" {
+    // 2024-02-29 12:00:00 UTC (Thursday)
+    var buf: [29]u8 = undefined;
+    formatHttpDate(&buf, 1709208000);
+    try std.testing.expectEqualStrings("Thu, 29 Feb 2024 12:00:00 GMT", &buf);
+}
+
+test "formatHttpDate - negative timestamp clamps to epoch" {
+    var buf: [29]u8 = undefined;
+    formatHttpDate(&buf, -100);
+    try std.testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", &buf);
+}
+
+test "formatHttpDate - all days of week" {
+    // Mon 2024-01-01 00:00:00
+    var buf: [29]u8 = undefined;
+    formatHttpDate(&buf, 1704067200);
+    try std.testing.expectEqualStrings("Mon, 01 Jan 2024 00:00:00 GMT", &buf);
+
+    // Tue 2024-01-02
+    formatHttpDate(&buf, 1704153600);
+    try std.testing.expectEqualStrings("Tue, 02 Jan 2024 00:00:00 GMT", &buf);
+
+    // Wed 2024-01-03
+    formatHttpDate(&buf, 1704240000);
+    try std.testing.expectEqualStrings("Wed, 03 Jan 2024 00:00:00 GMT", &buf);
+
+    // Thu 2024-01-04
+    formatHttpDate(&buf, 1704326400);
+    try std.testing.expectEqualStrings("Thu, 04 Jan 2024 00:00:00 GMT", &buf);
+
+    // Fri 2024-01-05
+    formatHttpDate(&buf, 1704412800);
+    try std.testing.expectEqualStrings("Fri, 05 Jan 2024 00:00:00 GMT", &buf);
+
+    // Sat 2024-01-06
+    formatHttpDate(&buf, 1704499200);
+    try std.testing.expectEqualStrings("Sat, 06 Jan 2024 00:00:00 GMT", &buf);
+
+    // Sun 2024-01-07
+    formatHttpDate(&buf, 1704585600);
+    try std.testing.expectEqualStrings("Sun, 07 Jan 2024 00:00:00 GMT", &buf);
+}
+
+test "formatIso8601 - Unix epoch" {
+    var buf: [20]u8 = undefined;
+    formatIso8601(&buf, 0);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", &buf);
+}
+
+test "formatIso8601 - known date" {
+    // 2024-01-15 11:30:45 UTC
+    var buf: [20]u8 = undefined;
+    formatIso8601(&buf, 1705318245);
+    try std.testing.expectEqualStrings("2024-01-15T11:30:45Z", &buf);
+}
+
+test "formatIso8601 - end of year" {
+    // 2023-12-31 23:59:59 UTC
+    var buf: [20]u8 = undefined;
+    formatIso8601(&buf, 1704067199);
+    try std.testing.expectEqualStrings("2023-12-31T23:59:59Z", &buf);
+}
+
+test "formatIso8601 - leap year" {
+    // 2024-02-29 12:00:00 UTC
+    var buf: [20]u8 = undefined;
+    formatIso8601(&buf, 1709208000);
+    try std.testing.expectEqualStrings("2024-02-29T12:00:00Z", &buf);
+}
+
+test "formatIso8601 - negative timestamp clamps to epoch" {
+    var buf: [20]u8 = undefined;
+    formatIso8601(&buf, -1);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", &buf);
+}
+
+test "formatIso8601 - all months" {
+    var buf: [20]u8 = undefined;
+    // Jan 2024-01-15
+    formatIso8601(&buf, 1705276800);
+    try std.testing.expect(std.mem.startsWith(u8, &buf, "2024-01-15"));
+    // Feb 2024-02-15
+    formatIso8601(&buf, 1707955200);
+    try std.testing.expect(std.mem.startsWith(u8, &buf, "2024-02-15"));
+    // Mar 2024-03-15
+    formatIso8601(&buf, 1710460800);
+    try std.testing.expect(std.mem.startsWith(u8, &buf, "2024-03-15"));
+    // Jun 2024-06-15
+    formatIso8601(&buf, 1718409600);
+    try std.testing.expect(std.mem.startsWith(u8, &buf, "2024-06-15"));
+    // Sep 2024-09-15
+    formatIso8601(&buf, 1726358400);
+    try std.testing.expect(std.mem.startsWith(u8, &buf, "2024-09-15"));
+    // Dec 2024-12-15
+    formatIso8601(&buf, 1734220800);
+    try std.testing.expect(std.mem.startsWith(u8, &buf, "2024-12-15"));
+}
+
+test "formatHttpDate - output length is exactly 29 bytes" {
+    var buf: [29]u8 = undefined;
+    formatHttpDate(&buf, 1705318245);
+    // Verify all 29 bytes are written (no null terminators or padding issues)
+    try std.testing.expectEqual(@as(usize, 29), buf.len);
+    // Verify the format structure: "Ddd, DD Mmm YYYY HH:MM:SS GMT"
+    try std.testing.expectEqual(@as(u8, ','), buf[3]);
+    try std.testing.expectEqual(@as(u8, ' '), buf[4]);
+    try std.testing.expectEqual(@as(u8, ' '), buf[7]);
+    try std.testing.expectEqual(@as(u8, ' '), buf[11]);
+    try std.testing.expectEqual(@as(u8, ' '), buf[16]);
+    try std.testing.expectEqual(@as(u8, ':'), buf[19]);
+    try std.testing.expectEqual(@as(u8, ':'), buf[22]);
+    try std.testing.expectEqual(@as(u8, ' '), buf[25]);
+    try std.testing.expectEqualStrings("GMT", buf[26..29]);
+}
+
+test "formatIso8601 - output length is exactly 20 bytes" {
+    var buf: [20]u8 = undefined;
+    formatIso8601(&buf, 1705318245);
+    try std.testing.expectEqual(@as(usize, 20), buf.len);
+    // Verify the format structure: "YYYY-MM-DDTHH:MM:SSZ"
+    try std.testing.expectEqual(@as(u8, '-'), buf[4]);
+    try std.testing.expectEqual(@as(u8, '-'), buf[7]);
+    try std.testing.expectEqual(@as(u8, 'T'), buf[10]);
+    try std.testing.expectEqual(@as(u8, ':'), buf[13]);
+    try std.testing.expectEqual(@as(u8, ':'), buf[16]);
+    try std.testing.expectEqual(@as(u8, 'Z'), buf[19]);
 }
