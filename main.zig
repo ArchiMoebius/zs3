@@ -1062,25 +1062,17 @@ pub fn main() !void {
         std.fs.cwd().makeDir(dot_index_path) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => {
-                return error.FailedDataDirDotCasCreation;
+                return error.FailedDataDirDotIndexCreation;
             },
         };
     }
 
     var access_control_map = std.StringHashMap(acl.Credential).init(allocator);
 
-    var ctx = S3Context{
-        .allocator = allocator,
-        .data_dir = build_options.data_dir,
-        .access_control_map = undefined,
-        .distributed = if (dist_ctx != null) &dist_ctx.? else null,
-    };
-    defer ctx.deinit();
-
     for (access_control_list) |credential| {
         if (credential.secret_key.len > 252) {
             // Never log the secret_key itself...
-            std.log.err("ACL credential '{s}' has an secret key exceeding 252 bytes; skipping", .{credential.access_key});
+            std.log.err("ACL credential '{s}' has a secret key exceeding 252 bytes; skipping", .{credential.access_key});
             continue;
         }
 
@@ -1090,9 +1082,19 @@ pub fn main() !void {
         }
 
         // The key is the slice contents, not the pointer address
-        try access_control_map.put(credential.access_key, credential);
+        access_control_map.put(credential.access_key, credential) catch |err| {
+            access_control_map.deinit();
+            return err;
+        };
     }
-    ctx.access_control_map = access_control_map;
+
+    var ctx = S3Context{
+        .allocator = allocator,
+        .data_dir = build_options.data_dir,
+        .access_control_map = access_control_map,
+        .distributed = if (dist_ctx != null) &dist_ctx.? else null,
+    };
+    defer ctx.deinit();
 
     const address = net.Address.parseIp4("0.0.0.0", port) catch unreachable;
     var server = try address.listen(.{ .reuse_address = true });
