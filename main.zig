@@ -1021,7 +1021,7 @@ pub fn main() !void {
         }
     }
 
-    std.fs.cwd().makeDir("data") catch |err| switch (err) {
+    std.fs.cwd().makeDir(build_options.data_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -1032,13 +1032,13 @@ pub fn main() !void {
 
     if (distributed_enabled) {
         // Generate or load node ID
-        const node_id = try getOrCreateNodeId(allocator, "data");
+        const node_id = try getOrCreateNodeId(allocator, build_options.data_dir);
         const config = DistributedConfig{
             .enabled = true,
             .node_id = node_id,
             .http_port = port,
         };
-        dist_ctx = DistributedContext.init(allocator, "data", config);
+        dist_ctx = DistributedContext.init(allocator, build_options.data_dir, config);
 
         var id_hex: [40]u8 = undefined;
         bytesToHex(&node_id, &id_hex);
@@ -1046,26 +1046,53 @@ pub fn main() !void {
         std.log.info("Known peers: {d}", .{dist_ctx.?.kademlia.peerCount()});
 
         // Create .cas and .index directories
-        std.fs.cwd().makePath("data/.cas") catch {};
-        std.fs.cwd().makePath("data/.index") catch {};
+        const dot_cas_path = try std.fs.path.join(allocator, &[_][]const u8{ build_options.data_dir, ".cas" });
+        defer allocator.free(dot_cas_path);
+
+        std.fs.cwd().makeDir(dot_cas_path) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => {
+                return error.FailedDataDirDotCasCreation;
+            },
+        };
+
+        const dot_index_path = try std.fs.path.join(allocator, &[_][]const u8{ build_options.data_dir, ".index" });
+        defer allocator.free(dot_index_path);
+
+        std.fs.cwd().makeDir(dot_index_path) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => {
+                return error.FailedDataDirDotCasCreation;
+            },
+        };
     }
 
     var access_control_map = std.StringHashMap(acl.Credential).init(allocator);
 
+    var ctx = S3Context{
+        .allocator = allocator,
+        .data_dir = build_options.data_dir,
+        .access_control_map = undefined,
+        .distributed = if (dist_ctx != null) &dist_ctx.? else null,
+    };
+    defer ctx.deinit();
+
     for (access_control_list) |credential| {
         if (credential.secret_key.len > 252) {
-            std.log.err("ACL credential '{s}' has a secret key exceeding 252 bytes; skipping", .{credential.secret_key});
+            // Never log the secret_key itself...
+            std.log.err("ACL credential '{s}' has an secret key exceeding 252 bytes; skipping", .{credential.access_key});
             continue;
         }
 
         if (credential.access_key.len > 252) {
-            std.log.err("ACL credential '{s}' has a access key exceeding 252 bytes; skipping", .{credential.access_key});
+            std.log.err("ACL credential '{s}' has an access key exceeding 252 bytes; skipping", .{credential.access_key});
             continue;
         }
 
         // The key is the slice contents, not the pointer address
         try access_control_map.put(credential.access_key, credential);
     }
+    ctx.access_control_map = access_control_map;
 
     const address = net.Address.parseIp4("0.0.0.0", port) catch unreachable;
     var server = try address.listen(.{ .reuse_address = true });
@@ -1076,14 +1103,6 @@ pub fn main() !void {
     } else {
         std.log.info("S3 server listening on http://0.0.0.0:{d}", .{port});
     }
-
-    var ctx = S3Context{
-        .allocator = allocator,
-        .data_dir = "data",
-        .access_control_map = access_control_map,
-        .distributed = if (dist_ctx != null) &dist_ctx.? else null,
-    };
-    defer ctx.deinit();
 
     if (builtin.os.tag == .linux) {
         try eventLoopEpoll(allocator, &ctx, &server);
