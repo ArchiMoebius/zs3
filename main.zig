@@ -1673,7 +1673,7 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
         } else {
             try handlePutObject(ctx, allocator, req, res, bucket, key);
         }
-    } else if (std.mem.eql(u8, req.method, "DELETE") and acl_ctx.allowed("DELETE")) {
+    } else if (std.mem.eql(u8, req.method, "DELETE")) {
         if (!acl_ctx.allowed("DELETE")) {
             sendError(res, 403, "AccessDenied", "Insufficient permissions");
             return;
