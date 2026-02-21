@@ -4,6 +4,7 @@ pub const Role = enum {
     Admin,
     Reader,
     Writer,
+    Unknown,
 };
 
 pub const Credential = struct {
@@ -27,40 +28,45 @@ pub fn stringToRole(role_str: []const u8) !Role {
 
 // Function to parse a single credential string: "role:access_key:secret_key"
 pub fn parseCredential(cred_str: []const u8) !Credential {
-    if (std.mem.count(u8, cred_str, ":") != 2) {
-        return error.BadCredentialFormat;
-    }
+    var itr = std.mem.splitScalar(u8, cred_str, ':');
 
-    var itr = std.mem.tokenizeSequence(u8, cred_str, ":");
+    const role_str = itr.next() orelse return error.BadCredentialFormat;
+    const access_key = itr.next() orelse return error.BadCredentialFormat;
+    const secret_key = itr.next() orelse return error.BadCredentialFormat;
+
+    // Reject extra fields
+    if (itr.next() != null) return error.BadCredentialFormat;
+
+    // Reject empty fields
+    if (role_str.len == 0 or access_key.len == 0 or secret_key.len == 0)
+        return error.BadCredentialFormat;
 
     return Credential{
-        .role = try stringToRole(itr.next().?),
-        .access_key = itr.next().?,
-        .secret_key = itr.next().?,
+        .role = try stringToRole(role_str),
+        .access_key = access_key,
+        .secret_key = secret_key,
     };
 }
 
 // Function to parse a list of credential strings
 pub fn parseCredentials(allocator: std.mem.Allocator, input: []const u8) ![]Credential {
-    const count = std.mem.count(u8, input, ":");
-
-    if (count < 2) {
+    if (input.len == 0) {
         return error.BadCredentialInputFormat;
     }
 
-    var credentials = try std.ArrayList(Credential).initCapacity(allocator, count / 2);
+    var credentials = std.ArrayListUnmanaged(Credential){};
+    errdefer credentials.deinit(allocator);
 
-    var itr = std.mem.tokenizeSequence(u8, input, ",");
+    var itr = std.mem.splitScalar(u8, input, ',');
+    while (itr.next()) |record| {
+        if (record.len == 0) continue;
 
-    if (itr.peek() == null) {
-        const pc = try parseCredential(input);
+        const pc = try parseCredential(record);
+
         try credentials.append(allocator, pc);
-    } else {
-        while (itr.next()) |record| {
-            const pc = try parseCredential(record);
-            try credentials.append(allocator, pc);
-        }
     }
+
+    if (credentials.items.len == 0) return error.BadCredentialInputFormat;
 
     return credentials.toOwnedSlice(allocator);
 }

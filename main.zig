@@ -1074,6 +1074,7 @@ pub fn main() !void {
         .access_control_map = access_control_map,
         .distributed = if (dist_ctx != null) &dist_ctx.? else null,
     };
+    defer ctx.deinit();
 
     if (builtin.os.tag == .linux) {
         try eventLoopEpoll(allocator, &ctx, &server);
@@ -1601,20 +1602,44 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
     // In distributed mode, use CAS for object storage
     if (ctx.distributed != null) {
         if (key.len > 0) {
-            if (std.mem.eql(u8, req.method, "PUT") and !hasQuery(req.query, "uploadId") and acl_ctx.allowed("PUT")) {
+            if (std.mem.eql(u8, req.method, "PUT") and !hasQuery(req.query, "uploadId")) {
+                if (!acl_ctx.allowed("PUT")) {
+                    sendError(res, 403, "AccessDenied", "Insufficient permissions");
+                    return;
+                }
+
                 try handleDistributedPut(ctx, allocator, req, res, bucket, key);
                 return;
-            } else if (std.mem.eql(u8, req.method, "GET") and acl_ctx.allowed("GET")) {
+            } else if (std.mem.eql(u8, req.method, "GET")) {
+                if (!acl_ctx.allowed("GET")) {
+                    sendError(res, 403, "AccessDenied", "Insufficient permissions");
+                    return;
+                }
+
                 try handleDistributedGet(ctx, allocator, req, res, bucket, key);
                 return;
-            } else if (std.mem.eql(u8, req.method, "DELETE") and !hasQuery(req.query, "uploadId") and acl_ctx.allowed("DELETE")) {
+            } else if (std.mem.eql(u8, req.method, "DELETE") and !hasQuery(req.query, "uploadId")) {
+                if (!acl_ctx.allowed("DELETE")) {
+                    sendError(res, 403, "AccessDenied", "Insufficient permissions");
+                    return;
+                }
+
                 try handleDistributedDelete(ctx, allocator, res, bucket, key);
                 return;
-            } else if (std.mem.eql(u8, req.method, "HEAD") and acl_ctx.allowed("HEAD")) {
+            } else if (std.mem.eql(u8, req.method, "HEAD")) {
+                if (!acl_ctx.allowed("HEAD")) {
+                    sendError(res, 403, "AccessDenied", "Insufficient permissions");
+                    return;
+                }
+
                 try handleDistributedHead(ctx, allocator, res, bucket, key);
                 return;
             }
-        } else if (bucket.len > 0 and std.mem.eql(u8, req.method, "GET") and acl_ctx.allowed("GET")) {
+        } else if (bucket.len > 0 and std.mem.eql(u8, req.method, "GET")) {
+            if (!acl_ctx.allowed("GET")) {
+                sendError(res, 403, "AccessDenied", "Insufficient permissions");
+                return;
+            }
             // Distributed LIST objects
             try handleDistributedList(ctx, allocator, req, res, bucket);
             return;
@@ -1622,7 +1647,12 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
     }
 
     // Standard S3 routing (standalone mode or bucket operations)
-    if (std.mem.eql(u8, req.method, "GET") and acl_ctx.allowed("GET")) {
+    if (std.mem.eql(u8, req.method, "GET")) {
+        if (!acl_ctx.allowed("GET")) {
+            sendError(res, 403, "AccessDenied", "Insufficient permissions");
+            return;
+        }
+
         if (bucket.len == 0) {
             try handleListBuckets(ctx, allocator, res);
         } else if (key.len == 0) {
@@ -1630,7 +1660,12 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
         } else {
             try handleGetObject(ctx, allocator, req, res, bucket, key);
         }
-    } else if (std.mem.eql(u8, req.method, "PUT") and acl_ctx.allowed("PUT")) {
+    } else if (std.mem.eql(u8, req.method, "PUT")) {
+        if (!acl_ctx.allowed("PUT")) {
+            sendError(res, 403, "AccessDenied", "Insufficient permissions");
+            return;
+        }
+
         if (key.len == 0) {
             try handleCreateBucket(ctx, allocator, res, bucket);
         } else if (hasQuery(req.query, "uploadId")) {
@@ -1639,6 +1674,11 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
             try handlePutObject(ctx, allocator, req, res, bucket, key);
         }
     } else if (std.mem.eql(u8, req.method, "DELETE") and acl_ctx.allowed("DELETE")) {
+        if (!acl_ctx.allowed("DELETE")) {
+            sendError(res, 403, "AccessDenied", "Insufficient permissions");
+            return;
+        }
+
         if (key.len == 0) {
             try handleDeleteBucket(ctx, allocator, res, bucket);
         } else if (hasQuery(req.query, "uploadId")) {
@@ -1646,13 +1686,23 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
         } else {
             try handleDeleteObject(ctx, allocator, res, bucket, key);
         }
-    } else if (std.mem.eql(u8, req.method, "HEAD") and acl_ctx.allowed("HEAD")) {
+    } else if (std.mem.eql(u8, req.method, "HEAD")) {
+        if (!acl_ctx.allowed("HEAD")) {
+            sendError(res, 403, "AccessDenied", "Insufficient permissions");
+            return;
+        }
+
         if (key.len == 0) {
             try handleHeadBucket(ctx, allocator, res, bucket);
         } else {
             try handleHeadObject(ctx, allocator, res, bucket, key);
         }
-    } else if (std.mem.eql(u8, req.method, "POST") and acl_ctx.allowed("POST")) {
+    } else if (std.mem.eql(u8, req.method, "POST")) {
+        if (!acl_ctx.allowed("POST")) {
+            sendError(res, 403, "AccessDenied", "Insufficient permissions");
+            return;
+        }
+
         if (hasQuery(req.query, "delete")) {
             try handleDeleteObjects(ctx, allocator, req, res, bucket);
         } else if (hasQuery(req.query, "uploads")) {
@@ -1684,7 +1734,6 @@ pub const SigV4 = struct {
         allow: bool,
         role: acl.Role,
 
-        // Change return type to !bool to allow returning errors
         fn allowed(self: *const ACLCtx, method: []const u8) bool {
             switch (self.role) {
                 acl.Role.Admin => {
@@ -1715,6 +1764,9 @@ pub const SigV4 = struct {
                         else => return false,
                     }
                 },
+                acl.Role.Unknown => {
+                    return false;
+                },
             }
         }
     };
@@ -1722,7 +1774,7 @@ pub const SigV4 = struct {
     fn verify(ctx: *const S3Context, req: *const Request, allocator: Allocator) ACLCtx {
         var acl_ctx = ACLCtx{
             .allow = false,
-            .role = undefined,
+            .role = acl.Role.Unknown,
         };
 
         const auth_header = req.header("authorization") orelse return acl_ctx;
